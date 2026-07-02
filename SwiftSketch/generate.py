@@ -14,6 +14,7 @@ import model.image_features_models as models
 from PIL import Image
 import wandb
 from transformers import AutoModelForImageSegmentation
+import pydiffvg
 
 
 def main():
@@ -146,6 +147,8 @@ def main():
                         input_image = Image.open(image_path)
                         print(f"Loaded image: {image_path}")
                         input_image = input_image.convert("RGB")
+                        # Force image to match the 1024x1024 mask shape
+                        input_image = input_image.resize((1024, 1024))
                         mask= sketch_utils.get_mask(input_image, args.device, mask_model)
                         input_image= sketch_utils.create_masked_image(input_image, mask)
                         if args.fix_scale:
@@ -241,6 +244,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # pydiffvg.set_use_gpu(torch.cuda.is_available() and use_gpu)
+    pydiffvg.set_use_gpu(False)
+    # pydiffvg.set_device(args.device)
+    pydiffvg.set_device(torch.device("cpu"))
     main()
 
 

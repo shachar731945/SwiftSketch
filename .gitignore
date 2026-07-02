@@ -1,2 +1,12 @@
 diffvg
-diffvg-torch
+**/__pycache__/**
+check.py
+save
+ControlSketch/CLIP_/clip/__pycache__/__init__.cpython-39.pyc
+ControlSketch/CLIP_/clip/__pycache__/auxilary.cpython-39.pyc
+ControlSketch/CLIP_/clip/__pycache__/clip.cpython-39.pyc
+ControlSketch/CLIP_/clip/__pycache__/model.cpython-39.pyc
+.venv-tmp/
+ControlSketch/CLIP_/clip/__pycache__/simple_tokenizer.cpython-39.pyc
+output_sketches/
+example_run_inputs/

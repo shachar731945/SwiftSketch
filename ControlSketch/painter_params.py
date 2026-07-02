@@ -57,7 +57,7 @@ class Painter(torch.nn.Module):
     def init_image(self):
         for i in range(self.num_paths):  
             stroke_color = torch.tensor([0.0, 0.0, 0.0, 1.0])
-            path = self.get_path() 
+            path = self.get_path(i) 
             self.shapes.append(path)
             path_group = pydiffvg.ShapeGroup(shape_ids=torch.tensor([len(self.shapes) - 1]),
                                                 fill_color=None,
@@ -83,10 +83,11 @@ class Painter(torch.nn.Module):
         img = img.permute(0, 3, 1, 2).to(self.device)  # HWC -> NCHW
         return img
 
-    def get_path(self):
+    def get_path(self, i):
         points = []
         self.num_control_points = torch.zeros(self.num_segments, dtype=torch.int32) + (self.control_points_per_seg - 2)
-        p0 = self.inds_normalised[self.strokes_counter] if self.use_init_method else (random.random(), random.random())
+        #assert self.strokes_counter < len(self.inds_normalised), f"the number of inds_normalized are {len(self.inds_normalised)} and the strokes counter is {self.strokes_counter}, i is {i}, num_path is {self.num_paths}"
+        p0 = self.inds_normalised[self.strokes_counter] if (self.use_init_method and self.strokes_counter < len(self.inds_normalised)) else (random.random(), random.random())
         self.initial_points.append(p0)
         points.append(p0) 
         for j in range(self.num_segments):  # here is 1 by defult
@@ -446,6 +447,7 @@ class Painter(torch.nn.Module):
         self.inds_normalised[:, 0] = self.inds[:, 0] / self.canvas_width
         self.inds_normalised[:, 1] = self.inds[:, 1] / self.canvas_height
         self.inds_normalised = self.inds_normalised.tolist()
+        #assert len(self.inds_normalised) != 0, "the inds_normalised should have len bigger than 0"
 
         return attn_map_to_plot
         

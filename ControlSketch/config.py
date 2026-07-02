@@ -134,7 +134,12 @@ def parse_arguments():
         args.device = torch.device("cpu")
 
     pydiffvg.set_use_gpu(torch.cuda.is_available() and use_gpu)
+    # pydiffvg.set_use_gpu(False)
     pydiffvg.set_device(args.device)
+    # print(args.device)
+    # print(torch.cuda.is_available() and use_gpu)
+    # exit()
+    # pydiffvg.set_device(torch.device("cpu"))
     return args
 
 
@@ -142,3 +147,4 @@ if __name__ == "__main__":
     args = parse_arguments()
     final_config = vars(args)
     np.save(f"{args.output_dir}/config_init.npy", final_config)
+    # print(final_config)
