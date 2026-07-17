@@ -18,6 +18,9 @@ wandb_api_key.txt
 initialize.sh
 control_script.sh
 
+**/output_sketches/
+**/angel_output_sketches/
+
 **/wandb/**
 **/train_results/**
 
