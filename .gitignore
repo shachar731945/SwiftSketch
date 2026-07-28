@@ -30,3 +30,5 @@ control_script.sh
 *.pt
 **/args.json
 
+*.pdf
+

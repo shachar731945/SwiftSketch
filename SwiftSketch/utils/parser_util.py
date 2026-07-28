@@ -205,7 +205,7 @@ def add_generate_options(parser):
     group.add_argument("--use_refine", default=1, type=int,
                        help="If 1, use the full SwiftSketch pipeline with the refinement network. If 0, use only the diffusion inference process.")
     group.add_argument("--fix_scale", type=int, default=0, help="if the target image is not squared, it is recommended to fix the scale")
-    group.add_argument("--guidance_param", default=2.5, type=float,
+    group.add_argument("--guidance_param", default=50, type=float,
                        help="For classifier-free sampling - specifies the s parameter, as defined in the paper.")
     group.add_argument("--save_final_sketch_in_dict", default=1, type=int,
                        help="If 1 and the input is a dict, save the final SwiftSketch SVG into the input dict.")

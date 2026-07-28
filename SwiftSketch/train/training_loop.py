@@ -39,6 +39,10 @@ class TrainLoop:
         
         self.num_steps = args.num_steps
         self.num_epochs = self.num_steps // len(self.data) + 1
+        # assert self.num_steps == 10_000
+        # print(f"THEHEHEHEHEHE DATATATA SIZEZEZEZEZ ISISISISISISIS {len(self.data)}")
+        # assert len(self.data) == 1_000
+        # assert self.num_epochs == 11
    
 
         self.sync_cuda = torch.cuda.is_available()

@@ -20,6 +20,7 @@ def parse_and_load_from_model(parser):
     # load args from model
     refine_model_path = get_model_path_from_args()
     args_path = os.path.join(os.path.dirname(refine_model_path), 'args.json')
+    print(args_path)
     assert os.path.exists(args_path), 'Arguments json file was not found!'
     with open(args_path, 'r') as fr:
         model_args = json.load(fr)
@@ -204,7 +205,7 @@ def add_generate_options(parser):
                        help="If 1, save the final SwiftSketch SVG results into the output_dir.")
     group.add_argument("--save_diffusion_sketch_in_dict", default=0, type=int,
                        help="If 1 and the input is a dict, save the diffusion process SVG into the input dict.")
-    group.add_argument("--guidance_param", default=2.5, type=float,
+    group.add_argument("--guidance_param", default=50, type=float,
                        help="For classifier-free sampling - specifies the s parameter, as defined in the paper.")
     group.add_argument("--model_path", default='', type=str,
                        help="Path to model####.pt file to be sampled.")

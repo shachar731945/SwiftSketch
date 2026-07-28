@@ -191,51 +191,52 @@ def main():
             dump_steps=None,  
             const_noise=False,
         )
-
-        diffusion_control_points= sample.clone()
               
-        if target_is_dict and args.save_diffusion_sketch_in_dict:
-            # Save diffusion SVG sketches in dicts
-            sample= sketch_utils.denormalize_points(sample, args.scaling_factor, args.canvas_width) #convert the normalized points back to the original range [224,224] 
-            _, svg_content_list = sketch_utils.rander_image_from_points(sample,args.canvas_width, args.canvas_height, return_svg_content=True)
-            key = f'svg_diffusion'
-            for image_file, svg_content in zip(images_files, svg_content_list):
-                target_file = f"{data_dir}/{image_file}"
-                sketch_utils.save_key(target_file,  svg_content, key)
-                print(f"The diffusion SVG was saved to the input dictionary, key is '{key}'")
+        # if target_is_dict and args.save_diffusion_sketch_in_dict:
+        #     # Save diffusion SVG sketches in dicts
+        #     sample= sketch_utils.denormalize_points(sample, args.scaling_factor, args.canvas_width) #convert the normalized points back to the original range [224,224] 
+        #     _, svg_content_list = sketch_utils.rander_image_from_points(sample,args.canvas_width, args.canvas_height, return_svg_content=True)
+        #     key = f'svg_diffusion'
+        #     for image_file, svg_content in zip(images_files, svg_content_list):
+        #         target_file = f"{data_dir}/{image_file}"
+        #         sketch_utils.save_key(target_file,  svg_content, key)
+        #         print(f"The diffusion SVG was saved to the input dictionary, key is '{key}'")
 
 
         if args.use_refine:
+            diffusion_control_points= sample.clone()
             assert len(diffusion_control_points) ==len(image_features), "Error loading or processing the data - refine model."
             batch_size= diffusion_control_points.shape[0]
             indices_np = np.full((batch_size,), 0) #t=0
             t = torch.from_numpy(indices_np).long().to(dist_util.dev())
-            refine_model_output = refine_model(x=diffusion_control_points, timesteps=t, image_features=image_features) #shape [bs,nstrokes, ncpoints, nfeats]
-            refine_model_output_points= refine_model_output
+            refine_model_output_points = refine_model(x=diffusion_control_points, timesteps=t, image_features=image_features) #shape [bs,nstrokes, ncpoints, nfeats]
             refine_model_output_points= sketch_utils.denormalize_points(refine_model_output_points, args.scaling_factor, args.canvas_width) #convert the normalized points back to the original range [224,224] 
             _, final_svg_content_list = sketch_utils.rander_image_from_points(refine_model_output_points,args.canvas_width, args.canvas_height, return_svg_content=True)
+        else:
+            sample= sketch_utils.denormalize_points(sample, args.scaling_factor, args.canvas_width) #convert the normalized points back to the original range [224,224] 
+            _, final_svg_content_list = sketch_utils.rander_image_from_points(sample,args.canvas_width, args.canvas_height, return_svg_content=True)
 
-            if target_is_dict and args.save_final_sketch_in_dict:
-                # Save final SVG sketches in dicts
-                key = f'svg_swiftsketch'
-                for image_file, svg_content in zip(images_files, final_svg_content_list):
-                    target_file = f"{data_dir}/{image_file}"
-                    sketch_utils.save_key(target_file, svg_content, key)
-                    print(f"The final SwiftSketch SVG was saved to the input dictionary {image_file}, key is '{key}'")
+        if target_is_dict and args.save_final_sketch_in_dict:
+            # Save final SVG sketches in dicts
+            key = f'svg_swiftsketch'
+            for image_file, svg_content in zip(images_files, final_svg_content_list):
+                target_file = f"{data_dir}/{image_file}"
+                sketch_utils.save_key(target_file, svg_content, key)
+                print(f"The final SwiftSketch SVG was saved to the input dictionary {image_file}, key is '{key}'")
 
-           
-            if args.save_svg:
-            # Save each SVG content with its corresponding name
-                for svg_content, name in zip(final_svg_content_list, images_files):
-                    base_name = os.path.splitext(name)[0] 
-                    output_file_path = os.path.join(output_path, f"{base_name}.svg")  # Construct file path
-                    with open(output_file_path, 'w') as svg_file:
-                        svg_file.write(svg_content)  # Write the SVG content to the file
+        if args.save_svg:
+        # Save each SVG content with its corresponding name
+            for svg_content, name in zip(final_svg_content_list, images_files):
+                base_name = os.path.splitext(name)[0] 
+                output_file_path = os.path.join(output_path, f"{base_name}.svg")  # Construct file path
+                with open(output_file_path, 'w') as svg_file:
+                    svg_file.write(svg_content)  # Write the SVG content to the file
 
-                print(f"SVG files saved in: {output_path}")
+            print(f"SVG files saved in: {output_path}")
         
         print("finish save batch number", batch_count)
         batch_count+=1
+        
     print("finish all")
 
     if args.use_wandb:
