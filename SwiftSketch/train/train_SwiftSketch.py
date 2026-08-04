@@ -47,6 +47,34 @@ def main():
     train_dataset = create_data_set(args.train_data_dir, args.target_key_name ,args.image_features_type, args.canvas_width,args.canvas_height, dist_util.dev(), args.scaling_factor, args.cat_data_size ,args.sort_by, args.use_data_cache, args.cache_path_dir, args.data_name)
     data= DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, pin_memory=True)
 
+    validation_data = None
+    if args.val_data_dir:
+        print("start validation data creation", flush=True)
+        validation_dataset = create_data_set(
+            args.val_data_dir,
+            args.target_key_name,
+            args.image_features_type,
+            args.canvas_width,
+            args.canvas_height,
+            dist_util.dev(),
+            args.scaling_factor,
+            args.cat_data_size,
+            args.sort_by,
+            args.use_data_cache,
+            args.cache_path_dir,
+            f"{args.data_name}_validation",
+        )
+        if len(validation_dataset) == 0:
+            raise ValueError("The validation dataset is empty. Check --val_data_dir and --target_key_name.")
+        validation_batch_size = args.val_batch_size or args.batch_size
+        validation_data = DataLoader(
+            validation_dataset,
+            batch_size=validation_batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=True,
+        )
+
     print("creating model and diffusion...", flush=True)
     model, diffusion = create_model_and_diffusion(args)
     model.to(dist_util.dev())
@@ -55,7 +83,7 @@ def main():
 
     print('Total params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0), flush=True)
     print("Training...", flush=True)
-    loop= TrainLoop(args, model, diffusion, data)
+    loop= TrainLoop(args, model, diffusion, data, validation_data)
     loop.run_loop()
     
 

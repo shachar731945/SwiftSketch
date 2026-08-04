@@ -18,21 +18,32 @@ from diffusion.resample import LossAwareSampler, UniformSampler
 
 
 class TrainLoop:
-    def __init__(self, args, model, diffusion, data):
+    def __init__(self, args, model, diffusion, data, validation_data=None):
         self.args = args
         self.model = model
         self.diffusion = diffusion
         self.cond_mode = model.cond_mode
         self.data = data
+        self.validation_data = validation_data
         self.batch_size = args.batch_size
         self.lr = args.lr
         self.log_interval = args.log_interval
+        self.val_interval = args.val_interval or args.log_interval
+        self.val_max_batches = args.val_max_batches
+        self.val_seed = args.val_seed
         self.save_interval = args.save_interval
         self.resume_checkpoint = args.resume_checkpoint
         self.use_fp16 = False  
         self.fp16_scale_growth = 1e-3  
         self.weight_decay = args.weight_decay
         self.lr_anneal_steps = args.lr_anneal_steps
+        self.lr_schedule = args.lr_schedule
+        self.lr_final_ratio = args.lr_final_ratio
+
+        if self.lr_schedule == "exponential" and self.lr_anneal_steps:
+            raise ValueError("--lr_schedule exponential cannot be combined with --lr_anneal_steps.")
+        if self.lr_schedule == "exponential" and not 0 < self.lr_final_ratio < 1:
+            raise ValueError("--lr_final_ratio must be greater than 0 and less than 1 for exponential scheduling.")
 
         self.step = 0
         self.resume_step = 0
@@ -131,6 +142,9 @@ class TrainLoop:
                             if self.args.use_wandb:
                                 wandb.log({f'Loss/{k}': v}, step=self.step+self.resume_step)
 
+                if self.validation_data is not None and self.step % self.val_interval == 0:
+                    self.evaluate_validation(self.step + self.resume_step)
+
 
                 if (self.step % self.save_interval == 0) and (self.step!=0):
                     self.save()
@@ -145,9 +159,87 @@ class TrainLoop:
 
     def run_step(self, target_rendered_images,target_control_points, image_features, step, resume_step):
         self.forward_backward( target_rendered_images,target_control_points, image_features, step, resume_step)
+        if self.lr_schedule == "exponential":
+            self._anneal_lr()
         self.mp_trainer.optimize(self.opt)
-        self._anneal_lr()
+        if self.lr_schedule != "exponential":
+            self._anneal_lr()
         self.log_step()
+
+    def evaluate_validation(self, global_step):
+        """Evaluate the full validation loss without changing model or RNG state."""
+        was_training = self.model.training
+        self.model.eval()
+        totals = {}
+        num_examples = 0
+        num_batches = 0
+        sample_index = 0
+
+        try:
+            with torch.no_grad():
+                generator = torch.Generator(device=self.device)
+                generator.manual_seed(self.val_seed)
+
+                for batch in self.validation_data:
+                    if self.val_max_batches and num_batches >= self.val_max_batches:
+                        break
+
+                    target_control_points, target_rendered_images, image_features = batch
+                    target_rendered_images = target_rendered_images.permute(0, 3, 1, 2).to(self.device)
+                    target_control_points = target_control_points.to(self.device)
+                    image_features = image_features.to(self.device)
+
+                    batch_size = target_control_points.shape[0]
+                    timesteps = (
+                        torch.arange(sample_index, sample_index + batch_size, device=self.device)
+                        % self.diffusion.num_timesteps
+                    ).long()
+                    noise = torch.randn(
+                        target_control_points.shape,
+                        dtype=target_control_points.dtype,
+                        device=self.device,
+                        generator=generator,
+                    )
+
+                    losses = self.diffusion.training_losses(
+                        self.model,
+                        target_control_points,
+                        target_rendered_images,
+                        image_features,
+                        timesteps,
+                        global_step,
+                        self.resume_step,
+                        noise=noise,
+                        mode="eval",
+                        log_results=False,
+                    )
+
+                    for key, value in losses.items():
+                        totals[key] = totals.get(key, 0.0) + value.detach().float().mean().item() * batch_size
+                    num_examples += batch_size
+                    num_batches += 1
+                    sample_index += batch_size
+        finally:
+            self.model.train(was_training)
+
+        if num_examples == 0:
+            print("Validation skipped: no batches were available.", flush=True)
+            return
+
+        validation_metrics = {
+            f"Validation/{key}": total / num_examples for key, total in totals.items()
+        }
+        validation_metrics["Validation/num_examples"] = num_examples
+        validation_metrics["Validation/num_batches"] = num_batches
+
+        print(
+            "step[{}]: validation_loss[{:0.5f}]".format(
+                global_step, validation_metrics["Validation/loss"]
+            ),
+            flush=True,
+        )
+        if self.args.use_wandb:
+            wandb.log(validation_metrics, step=global_step)
 
        
         
@@ -185,9 +277,20 @@ class TrainLoop:
         self.mp_trainer.backward(loss)
 
     def _anneal_lr(self):
+        if self.lr_schedule == "exponential":
+            # Decay from the initial LR to --lr_final_ratio of it across this run.
+            # The local step is intentional: each explicit continuation run gets
+            # the schedule requested for its own --num_steps budget.
+            progress = min(1.0, self.step / max(1, self.num_steps - 1))
+            lr = self.lr * (self.lr_final_ratio ** progress)
+            for param_group in self.opt.param_groups:
+                param_group["lr"] = lr
+            return
+
         if not self.lr_anneal_steps:
             return
-        frac_done = (self.step + self.resume_step) / self.lr_anneal_steps
+        # frac_done = (self.step + self.resume_step) / self.lr_anneal_steps
+        frac_done = min(1.0, (self.step + self.resume_step) / self.lr_anneal_steps)
         lr = self.lr * (1 - frac_done)
         for param_group in self.opt.param_groups:
             param_group["lr"] = lr

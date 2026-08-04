@@ -192,15 +192,23 @@ def main():
             const_noise=False,
         )
               
-        # if target_is_dict and args.save_diffusion_sketch_in_dict:
-        #     # Save diffusion SVG sketches in dicts
-        #     sample= sketch_utils.denormalize_points(sample, args.scaling_factor, args.canvas_width) #convert the normalized points back to the original range [224,224] 
-        #     _, svg_content_list = sketch_utils.rander_image_from_points(sample,args.canvas_width, args.canvas_height, return_svg_content=True)
-        #     key = f'svg_diffusion'
-        #     for image_file, svg_content in zip(images_files, svg_content_list):
-        #         target_file = f"{data_dir}/{image_file}"
-        #         sketch_utils.save_key(target_file,  svg_content, key)
-        #         print(f"The diffusion SVG was saved to the input dictionary, key is '{key}'")
+        if target_is_dict and args.save_diffusion_sketch_in_dict:
+            # Save diffusion SVG sketches in the input dictionaries for
+            # refinement-network training.
+            diffusion_points = sketch_utils.denormalize_points(
+                sample, args.scaling_factor, args.canvas_width
+            )
+            _, svg_content_list = sketch_utils.rander_image_from_points(
+                diffusion_points,
+                args.canvas_width,
+                args.canvas_height,
+                return_svg_content=True,
+            )
+            key = "svg_diffusion"
+            for image_file, svg_content in zip(images_files, svg_content_list):
+                target_file = f"{data_dir}/{image_file}"
+                sketch_utils.save_key(target_file, svg_content, key)
+                print(f"The diffusion SVG was saved to the input dictionary {image_file}, key is '{key}'")
 
 
         if args.use_refine:
@@ -250,5 +258,4 @@ if __name__ == "__main__":
     # pydiffvg.set_device(args.device)
     pydiffvg.set_device(torch.device("cpu"))
     main()
-
 

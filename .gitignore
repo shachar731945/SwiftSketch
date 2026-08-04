@@ -31,4 +31,7 @@ control_script.sh
 **/args.json
 
 *.pdf
+*.svg
+
+*_PLAN.md
 

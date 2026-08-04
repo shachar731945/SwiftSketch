@@ -2,6 +2,7 @@ from argparse import ArgumentParser
 import argparse
 import os
 import json
+import sys
 
 
 
@@ -142,6 +143,8 @@ def add_data_options(parser):
     group = parser.add_argument_group('dataset')
     parser.add_argument('--train_data_dir', type=str, nargs='+', default=[],
                         help="List of training data directories")
+    parser.add_argument('--val_data_dir', type=str, nargs='+', default=[],
+                        help="Optional list of validation data directories. If omitted, validation is disabled.")
     group.add_argument("--cat_data_size", default=10000, type=int,
                        help="The maximum number of files to use per category (input data path)")
     group.add_argument("--scaling_factor", default=2.0, type=float,
@@ -177,8 +180,20 @@ def add_training_options(parser):
     group.add_argument("--lr", default=5e-05, type=float, help="Learning rate.")
     group.add_argument("--weight_decay", default=0.0, type=float, help="Optimizer weight decay.")
     group.add_argument("--lr_anneal_steps", default=0, type=int, help="Number of learning rate anneal steps.")
+    group.add_argument("--lr_schedule", default="none", choices=["none", "exponential"], type=str,
+                       help="Learning-rate schedule. Exponential decays from --lr to --lr_final_ratio of --lr over --num_steps.")
+    group.add_argument("--lr_final_ratio", default=0.01, type=float,
+                       help="Final LR divided by initial LR for --lr_schedule exponential (for example, 0.01 or 0.02).")
     group.add_argument("--log_interval", default=5_000, type=int,
                        help="Log losses each N steps")
+    group.add_argument("--val_interval", default=0, type=int,
+                       help="Run validation each N steps. Set to 0 to use --log_interval.")
+    group.add_argument("--val_batch_size", default=0, type=int,
+                       help="Validation batch size. Set to 0 to use --batch_size.")
+    group.add_argument("--val_max_batches", default=0, type=int,
+                       help="Maximum validation batches per evaluation. Set to 0 to use the full validation set.")
+    group.add_argument("--val_seed", default=1234, type=int,
+                       help="Seed for deterministic validation timesteps and diffusion noise.")
     group.add_argument("--save_interval", default=10_000, type=int,
                        help="Save checkpoints each N steps")
     group.add_argument("--num_steps", default=60_000, type=int,
@@ -205,7 +220,7 @@ def add_generate_options(parser):
     group.add_argument("--use_refine", default=1, type=int,
                        help="If 1, use the full SwiftSketch pipeline with the refinement network. If 0, use only the diffusion inference process.")
     group.add_argument("--fix_scale", type=int, default=0, help="if the target image is not squared, it is recommended to fix the scale")
-    group.add_argument("--guidance_param", default=50, type=float,
+    group.add_argument("--guidance_param", default=2.5, type=float,
                        help="For classifier-free sampling - specifies the s parameter, as defined in the paper.")
     group.add_argument("--save_final_sketch_in_dict", default=1, type=int,
                        help="If 1 and the input is a dict, save the final SwiftSketch SVG into the input dict.")
@@ -238,7 +253,18 @@ def train_args():
     add_loss_options(parser)
     add_wandb_options(parser)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lr_schedule == "exponential":
+        lr_anneal_was_specified = any(
+            argument == "--lr_anneal_steps" or argument.startswith("--lr_anneal_steps=")
+            for argument in sys.argv[1:]
+        )
+        if lr_anneal_was_specified:
+            parser.error("--lr_schedule exponential cannot be combined with --lr_anneal_steps. "
+                         "Remove one schedule option before training.")
+        if not 0 < args.lr_final_ratio < 1:
+            parser.error("--lr_final_ratio must be greater than 0 and less than 1 when --lr_schedule exponential is used.")
+    return args
 
 
 def generate_args():
@@ -250,9 +276,4 @@ def generate_args():
     args = parse_and_load_from_model(parser)
 
     return args
-
-
-
-
-
 

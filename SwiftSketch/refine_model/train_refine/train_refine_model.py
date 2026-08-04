@@ -54,6 +54,34 @@ def main():
     train_dataset = create_data_set_refine_model(args.train_data_dir, args.target_key_name, args.diffusion_key_name ,args.image_features_type, args.canvas_width,args.canvas_height, dist_util.dev(), args.scaling_factor, args.cat_data_size, args.sort_by,args.use_data_cache, args.cache_path_dir, args.data_name)
     data= DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
+    validation_data = None
+    if args.val_data_dir:
+        print("start validation data creation", flush=True)
+        validation_dataset = create_data_set_refine_model(
+            args.val_data_dir,
+            args.target_key_name,
+            args.diffusion_key_name,
+            args.image_features_type,
+            args.canvas_width,
+            args.canvas_height,
+            dist_util.dev(),
+            args.scaling_factor,
+            args.cat_data_size,
+            args.sort_by,
+            args.use_data_cache,
+            args.cache_path_dir,
+            f"{args.data_name}_validation",
+        )
+        if len(validation_dataset) == 0:
+            raise ValueError("The validation dataset is empty. Check --val_data_dir, --target_key_name, and --diffusion_key_name.")
+        validation_batch_size = args.val_batch_size or args.batch_size
+        validation_data = DataLoader(
+            validation_dataset,
+            batch_size=validation_batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+
     train_sample= None
     if args.train_sample_dir!= "":
         train_sample_dataset, train_sample_images = create_data_set_refine_model_test(args.train_sample_dir , args.target_key_name, args.diffusion_key_name, args.image_features_type, args.canvas_width,args.canvas_height, dist_util.dev(), args.scaling_factor, args.sort_by)
@@ -70,7 +98,7 @@ def main():
 
     print('Total params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0), flush=True)
     print("Training...", flush=True)
-    loop= TrainLoop(args, model, data, train_sample, test)
+    loop= TrainLoop(args, model, data, train_sample, test, validation_data)
     loop.run_loop()
     
     if args.use_wandb:

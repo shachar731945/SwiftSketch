@@ -19,22 +19,35 @@ from diffusion.Loss_computation import Loss
 
 
 class TrainLoop:
-    def __init__(self, args, model, data , train_sample, test):
+    def __init__(self, args, model, data , train_sample, test, validation_data=None):
         self.args = args
         self.model = model
         self.cond_mode = model.cond_mode
         self.data = data
         self.train_sample = train_sample
         self.test = test
+        self.validation_data = validation_data
         self.batch_size = args.batch_size
         self.lr = args.lr
         self.log_interval = args.log_interval
+        self.val_interval = args.val_interval or args.log_interval
+        self.val_max_batches = args.val_max_batches
         self.save_interval = args.save_interval
+        self.init_checkpoint = args.init_checkpoint
         self.resume_checkpoint = args.resume_checkpoint
+        self._active_resume_checkpoint = None
+        self.is_resuming = False
         self.use_fp16 = False  
         self.fp16_scale_growth = 1e-3  
         self.weight_decay = args.weight_decay
         self.lr_anneal_steps = args.lr_anneal_steps
+        self.lr_schedule = args.lr_schedule
+        self.lr_final_ratio = args.lr_final_ratio
+
+        if self.lr_schedule == "exponential" and self.lr_anneal_steps:
+            raise ValueError("--lr_schedule exponential cannot be combined with --lr_anneal_steps.")
+        if self.lr_schedule == "exponential" and not 0 < self.lr_final_ratio < 1:
+            raise ValueError("--lr_final_ratio must be greater than 0 and less than 1 for exponential scheduling.")
 
         self.step = 0
         self.resume_step = 0
@@ -61,10 +74,9 @@ class TrainLoop:
         self.opt = AdamW(
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
         )
-        if self.resume_step:
+        if self.is_resuming:
             self._load_optimizer_state()
-            # Model was resumed, either due to a restart or a checkpoint
-            # being specified at the command line.
+            # Model and optimizer were resumed from a refinement checkpoint.
 
         self.device = torch.device("cpu")
         if torch.cuda.is_available() and dist_util.dev() != 'cpu':
@@ -76,20 +88,38 @@ class TrainLoop:
         
 
     def _load_and_sync_parameters(self):
-        resume_checkpoint = find_resume_checkpoint(self.args.save_dir) or self.resume_checkpoint
-        print("resume_checkpoint", resume_checkpoint)
+        local_resume_checkpoint = find_resume_checkpoint(self.args.save_dir)
+        resume_checkpoint = local_resume_checkpoint or self.resume_checkpoint
+
+        if self.init_checkpoint and resume_checkpoint:
+            raise ValueError(
+                "--init_checkpoint cannot be combined with an existing refinement checkpoint "
+                "or --resume_checkpoint. Use a new --title/save directory to initialize a new refinement run."
+            )
+
         if resume_checkpoint:
+            self._active_resume_checkpoint = resume_checkpoint
+            self.is_resuming = True
             self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
+            print("resume_checkpoint", resume_checkpoint)
             print("resume_step" , self.resume_step)
-            logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
+            logger.log(f"resuming refinement model from checkpoint: {resume_checkpoint}...")
             self.model.load_state_dict(
                 dist_util.load_state_dict(
                     resume_checkpoint, map_location=dist_util.dev()
                 )
             )
+        elif self.init_checkpoint:
+            print("init_checkpoint", self.init_checkpoint)
+            logger.log(f"initializing refinement model weights from diffusion checkpoint: {self.init_checkpoint}...")
+            self.model.load_state_dict(
+                dist_util.load_state_dict(
+                    self.init_checkpoint, map_location=dist_util.dev()
+                )
+            )
 
     def _load_optimizer_state(self):
-        main_checkpoint = find_resume_checkpoint(self.args.save_dir) or self.resume_checkpoint
+        main_checkpoint = self._active_resume_checkpoint
         print("main_checkpoint", main_checkpoint)
         opt_checkpoint = bf.join(
             bf.dirname(main_checkpoint), f"opt{self.resume_step:09}.pt"
@@ -121,18 +151,21 @@ class TrainLoop:
                 if self.step % self.log_interval == 0:
                     for k,v in logger.get_current().dumpkvs().items():
                         if k == 'loss':
-                            print('step[{}]: loss[{:0.5f}]'.format(self.step, v))
+                            print('step[{}]: loss[{:0.5f}]'.format(self.step + self.resume_step, v), flush=True)
 
                         if k in ['step', 'samples']:
                             continue
                         else:
                             if self.args.use_wandb:
-                                wandb.log({f'Loss/{k}': v}, step=self.step)
+                                wandb.log({f'Loss/{k}': v}, step=self.step + self.resume_step)
                 
                 if (self.step % self.args.log_interval == 0) or (self.step==5):
                     self.model.eval()
                     self.evaluate(self.step, self.resume_step)
                     self.model.train()
+
+                if self.validation_data is not None and self.step % self.val_interval == 0:
+                    self.evaluate_validation(self.step + self.resume_step)
 
 
                 if (self.step % self.save_interval == 0) and (self.step!=0):
@@ -182,7 +215,68 @@ class TrainLoop:
                             wandb_dict={}
                             for k in losses.keys():
                                 wandb_dict[f"{data_name}_{k}"] = losses[k]
-                            wandb.log(wandb_dict, step=step)
+                            wandb.log(wandb_dict, step=step + resume_step)
+
+    def evaluate_validation(self, global_step):
+        """Evaluate the held-out refinement loss without updating model parameters."""
+        was_training = self.model.training
+        self.model.eval()
+        totals = {}
+        num_examples = 0
+        num_batches = 0
+
+        try:
+            with torch.no_grad():
+                for batch in self.validation_data:
+                    if self.val_max_batches and num_batches >= self.val_max_batches:
+                        break
+
+                    target_control_points, target_rendered_images, diffusion_control_points, image_features = batch
+                    target_rendered_images = target_rendered_images.permute(0, 3, 1, 2).to(self.device)
+                    target_control_points = target_control_points.to(self.device)
+                    diffusion_control_points = diffusion_control_points.to(self.device)
+                    image_features = image_features.to(self.device)
+
+                    batch_size = target_control_points.shape[0]
+                    # mode="eval" disables LPIPS's random training augmentations,
+                    # yielding a stable held-out metric across validation runs.
+                    losses = self.training_losses(
+                        self.model,
+                        target_control_points,
+                        diffusion_control_points,
+                        target_rendered_images,
+                        image_features,
+                        torch.zeros(batch_size, dtype=torch.long, device=self.device),
+                        global_step,
+                        self.resume_step,
+                        mode="eval",
+                    )
+
+                    for key, value in losses.items():
+                        totals[key] = totals.get(key, 0.0) + value.detach().float().mean().item() * batch_size
+                    num_examples += batch_size
+                    num_batches += 1
+        finally:
+            self.model.train(was_training)
+
+        if num_examples == 0:
+            print("Validation skipped: no batches were available.", flush=True)
+            return
+
+        validation_metrics = {
+            f"Validation/{key}": total / num_examples for key, total in totals.items()
+        }
+        validation_metrics["Validation/num_examples"] = num_examples
+        validation_metrics["Validation/num_batches"] = num_batches
+
+        print(
+            "step[{}]: validation_loss[{:0.5f}]".format(
+                global_step, validation_metrics["Validation/loss"]
+            ),
+            flush=True,
+        )
+        if self.args.use_wandb:
+            wandb.log(validation_metrics, step=global_step)
 
             
         
@@ -190,8 +284,11 @@ class TrainLoop:
 
     def run_step(self, target_rendered_images,target_control_points, diffusion_control_points, image_features, step, resume_step):
         self.forward_backward( target_rendered_images,target_control_points,diffusion_control_points,image_features, step, resume_step)
+        if self.lr_schedule == "exponential":
+            self._anneal_lr()
         self.mp_trainer.optimize(self.opt)
-        self._anneal_lr()
+        if self.lr_schedule != "exponential":
+            self._anneal_lr()
         self.log_step()
 
     def forward_backward(self, target_rendered_images,target_control_points,diffusion_control_points, image_features, step, resume_step):
@@ -260,9 +357,20 @@ class TrainLoop:
 
 
     def _anneal_lr(self):
+        if self.lr_schedule == "exponential":
+            # Decay from the initial LR to --lr_final_ratio of it across this run.
+            # The local step is intentional: each explicit continuation run gets
+            # the schedule requested for its own --num_steps budget.
+            progress = min(1.0, self.step / max(1, self.num_steps - 1))
+            lr = self.lr * (self.lr_final_ratio ** progress)
+            for param_group in self.opt.param_groups:
+                param_group["lr"] = lr
+            return
+
         if not self.lr_anneal_steps:
             return
-        frac_done = (self.step + self.resume_step) / self.lr_anneal_steps
+        # frac_done = (self.step + self.resume_step) / self.lr_anneal_steps
+        frac_done = min(1.0, (self.step + self.resume_step) / self.lr_anneal_steps)
         lr = self.lr * (1 - frac_done)
         for param_group in self.opt.param_groups:
             param_group["lr"] = lr
@@ -335,4 +443,3 @@ def find_resume_checkpoint(save_dir) -> Optional[str]:
 def log_loss_dict(losses):
     for key, values in losses.items():
         logger.logkv_mean(key, values.mean().item())
-

@@ -628,7 +628,19 @@ class GaussianDiffusion:
                 
 
 
-    def training_losses(self, model, x_start, x_start_randered_images, image_features,t,step, resume_step, noise=None):
+    def training_losses(
+        self,
+        model,
+        x_start,
+        x_start_randered_images,
+        image_features,
+        t,
+        step,
+        resume_step,
+        noise=None,
+        mode="train",
+        log_results=True,
+    ):
 
         """
         Compute training losses for a single timestep.
@@ -672,7 +684,7 @@ class GaussianDiffusion:
                 model_output_points= model_output
 
 
-            if self.args.use_wandb: #log model prediction 
+            if log_results and self.args.use_wandb: #log model prediction
 
                 if step % self.args.log_interval == 0:
                     x0_sketch= render_image_from_norm_points(x_start[0].unsqueeze(0), self.args.scaling_factor, self.args.canvas_width)[0]
@@ -700,7 +712,13 @@ class GaussianDiffusion:
         model_output= model_output.reshape(bs, nstrokes, ncpoints*nfeats)# [bs,nstrokes, ncpoints*nfeats (8)]
         target= target.reshape(bs, nstrokes, ncpoints*nfeats)# [bs,nstrokes, ncpoints*nfeats (8)]
 
-        terms = self.loss_func(output_rendered_images,x_start_randered_images.detach(), model_output, target.detach(), mode= "train")
+        terms = self.loss_func(
+            output_rendered_images,
+            x_start_randered_images.detach(),
+            model_output,
+            target.detach(),
+            mode=mode,
+        )
         terms["loss"] = sum(list(terms.values())) 
         return terms
     

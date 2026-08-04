@@ -198,6 +198,9 @@ Optional arguments include:
 * ```--num_steps``` Number of training steps
 * ```--batch_size``` Batch size used during training
 * ```--save_interval``` Save checkpoints every N steps
+* ```--lr_schedule exponential``` Exponentially decays the learning rate from `--lr` to `--lr_final_ratio` of `--lr` across `--num_steps`. Set `--lr_final_ratio 0.01` (default) for 1% or `0.02` for 2%. It cannot be combined with ```--lr_anneal_steps```; the program exits with an error before training if both are set.
+* ```--val_data_dir``` One or more held-out data directories. When provided, validation losses are logged to Weights & Biases as `Validation/loss`, `Validation/L1_points`, and `Validation/LPIPS`.
+* ```--val_interval``` Validation frequency in steps. The default (`0`) uses `--log_interval`; ```--val_max_batches 0``` evaluates the full validation set.
 * ```--data_name``` Filename for the cached data
 * ```--cat_data_size``` Maximum number of files to use per category (input data path)
 * ```--target_key_name``` Name of the target SVG key (the ControlSketch sketch) in the input dictionaries. Default: "svg_32s", consistent with ControlSketch generation.
@@ -231,18 +234,22 @@ To train the refinement network , from SwiftSketch run:
 ```bash
 python -m refine_model.train_refine.train_refine_model \
   --save_dir "<path/to/save_dir>" \
-  --resume_checkpoint "<path/to/pretrained_sketch_diffusion_model.pt>" \
+  --init_checkpoint "<path/to/pretrained_sketch_diffusion_model.pt>" \
   --train_data_dir "<path/to/training_data>"
 ```
 
 - The model checkpoints and cached data will be saved in the specified save_dir folder.
 - The train_data_dir can be one or more paths to data folders
-- The --resume_checkpoint argument specifies the path to a pretrained Sketch Diffusion model checkpoint file (e.g., path/to/model###.pt). Training will resume from this checkpoint.    
+- The `--init_checkpoint` argument specifies the pretrained Sketch Diffusion checkpoint. Its model weights initialize the refinement network, while refinement training starts at step 0 with a new optimizer.
+- To continue a refinement run, use `--resume_checkpoint` with a refinement-network checkpoint. This restores its model weights, optimizer state, and training step. Do not provide `--init_checkpoint` when resuming.
 
 Optional arguments include:
 * ```--num_steps``` Number of training steps
 * ```--batch_size``` Batch size used during training
 * ```--save_interval``` Save checkpoints every N steps
+* ```--lr_schedule exponential``` Exponentially decays the learning rate from `--lr` to `--lr_final_ratio` of `--lr` across `--num_steps`. Set `--lr_final_ratio 0.01` (default) for 1% or `0.02` for 2%. It cannot be combined with ```--lr_anneal_steps```; the program exits with an error before training if both are set.
+* ```--val_data_dir``` One or more held-out data directories. When provided, validation losses are logged to Weights & Biases as `Validation/loss`, `Validation/L1_points`, and `Validation/LPIPS`.
+* ```--val_interval``` Validation frequency in steps. The default (`0`) uses `--log_interval`; ```--val_max_batches 0``` evaluates the full validation set.
 * ```--data_name``` Filename for the cached data
 * ```--cat_data_size``` Maximum number of files to use per category (input data path)
 * ```--target_key_name``` Name of the target SVG key (the ControlSketch sketch) in the input dictionaries. Default: "svg_32s", consistent with ControlSketch generation.
@@ -253,7 +260,7 @@ The command below trains the refinement model for 10,000 steps on 1,000 samples 
 ```bash
 python -m refine_model.train_refine.train_refine_model \
     --save_dir "./save/cat_dog_refine_model" \
-    --resume_checkpoint "./save/sketch-diffusion/model000450000.pt" \
+    --init_checkpoint "./save/sketch-diffusion/model000450000.pt" \
     --num_steps 10000 \
     --data_name "cat_dog_data" \
     --cat_data_size 1000 \
@@ -281,4 +288,3 @@ keywords = {Sketch Synthesis, Image-to-Vector Generation, Image-based Rendering,
 series = {SIGGRAPH Conference Papers '25}
 }
 ```
-
