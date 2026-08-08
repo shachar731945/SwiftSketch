@@ -92,8 +92,13 @@ class LPIPS(torch.nn.Module):
 
         # Shape of xs and ys: [5*batch_size, C, 224, 224]
 
+        # The target branch is detached by both training loops and the VGG
+        # parameters are frozen. Run it first without autograd so its
+        # temporary VGG activations are released before retaining the much
+        # larger activation graph needed to differentiate the prediction.
+        with torch.no_grad():
+            target = self.feature_extractor(ys)
         pred = self.feature_extractor(xs)
-        target = self.feature_extractor(ys)
 
         # Shape of pred and target: [5*batch_size, C_i, H_i, W_i] (for each feature map)
         # The feature extractor will output a list of feature maps with different channels and spatial sizes depending on the layers used.
@@ -184,4 +189,3 @@ class L1_points(torch.nn.Module):
 
 
                 
-

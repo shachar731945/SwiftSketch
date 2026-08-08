@@ -135,10 +135,11 @@ def zero_master_grads(master_params):
 
 def zero_grad(model_params):
     for param in model_params:
-        # Taken from https://pytorch.org/docs/stable/_modules/torch/optim/optimizer.html#Optimizer.add_param_group
+        # ``None`` lets PyTorch reuse the previous gradient allocation for
+        # forward/backward activations. It is equivalent to zeroing for the
+        # AdamW optimizer used here, while reducing the per-step memory peak.
         if param.grad is not None:
-            param.grad.detach_()
-            param.grad.zero_()
+            param.grad = None
 
 
 def param_grad_or_zeros(param):
