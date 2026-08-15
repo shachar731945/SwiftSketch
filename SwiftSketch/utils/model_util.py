@@ -35,13 +35,15 @@ def get_model_args(args):
     emb_trans_dec=args.emb_trans_dec 
     normalize_model_output= args.normalize_model_output
     scaling_factor= args.scaling_factor
+    diffusion_mode = getattr(args, "diffusion_mode", "ddpm")
 
 
     return { 'latent_dim': latent_dim, 'ff_size': ff_size, 'num_layers': num_layers, 'num_heads': num_heads,
             'dropout': dropout, 'activation': activation , 'cond_mode': cond_mode,
             'cond_mask_prob':cond_mask_prob, 'image_features_type': image_features_type, 
             'normalize_model_output': normalize_model_output, 
-            'arch': arch, 'emb_trans_dec': emb_trans_dec, 'scaling_factor': scaling_factor}
+            'arch': arch, 'emb_trans_dec': emb_trans_dec, 'scaling_factor': scaling_factor,
+            'diffusion_mode': diffusion_mode}
 
 
 def create_gaussian_diffusion(args):
@@ -60,12 +62,8 @@ def create_gaussian_diffusion(args):
         assert args.model_mean_type=='epsilon', "model_mean_type must be in ['start_x', 'epsilon']"
         model_mean_type= gd.ModelMeanType.EPSILON
 
-    if not timestep_respacing:
-        timestep_respacing = [steps]
-
-    return SpacedDiffusion(
+    diffusion_kwargs = dict(
         args=args,
-        use_timesteps=space_timesteps(steps, timestep_respacing),
         betas=betas,
         model_mean_type=model_mean_type,
         model_var_type=(
@@ -78,4 +76,17 @@ def create_gaussian_diffusion(args):
             else gd.ModelVarType.LEARNED_RANGE
         ),
         rescale_timesteps=rescale_timesteps,
+    )
+
+    if getattr(args, "diffusion_mode", "ddpm") == "cfm_ddim":
+        # CFM uses differentiable continuous times in the original schedule
+        # and therefore intentionally bypasses the discrete respacing wrapper.
+        return gd.GaussianDiffusion(**diffusion_kwargs)
+
+    if not timestep_respacing:
+        timestep_respacing = [steps]
+
+    return SpacedDiffusion(
+        use_timesteps=space_timesteps(steps, timestep_respacing),
+        **diffusion_kwargs,
     )

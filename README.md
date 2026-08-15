@@ -217,6 +217,49 @@ python -m train.train_SwiftSketch \
     --train_data_dir "./controlsketch_data/train/cat" "./controlsketch_data/train/dog"
 ```
 
+<b>Cumulative Flow Map DDIM mode:</b>
+
+CFM-DDIM is an additive training and generation mode. The existing DDPM mode
+remains the default. A new CFM model can be initialized from a compatible DDPM
+checkpoint without restoring the DDPM optimizer or training step:
+
+```bash
+python -m train.train_SwiftSketch \
+    --diffusion_mode cfm_ddim \
+    --init_checkpoint "<path/to/ddpm-model.pt>" \
+    --save_dir "<path/to/save_dir>" \
+    --train_data_dir "<path/to/training_data>" \
+    --val_data_dir "<path/to/validation_data>"
+```
+
+The pure implementation optimizes the stopped-target CFM-DDIM MSE from the
+paper. `--cfm_instantaneous_prob` defaults to `0.5`, and
+`--cfm_loss_weight` defaults to `1.0`. In this mode LPIPS and L1 weights are
+automatically forced to zero. Use `--init_checkpoint` for model-only
+initialization (fresh optimizer and step 0), and `--resume_checkpoint` to
+restore an existing model together with its optimizer and step.
+
+CFM always uses normalized continuous times in `[0, 1]`, with `0` clean and
+`1` noisy.
+`--diffusion_steps` only selects the internal DDIM schedule discretization;
+it no longer changes the CFM time scale or the number of generation calls.
+CFM checkpoints created before this normalized-time implementation are
+intentionally unsupported.
+
+Generate from a CFM checkpoint with a selectable number of deterministic
+cumulative DDIM hops:
+
+```bash
+python -m generate \
+    --model_path "<path/to/cfm-model.pt>" \
+    --input_data "<path/to/input>" \
+    --cfm_sampling_steps 1
+```
+
+The normalized CFM clock uses clean ground truth `x_0` at time zero and the
+noisiest state at time one. One-step generation therefore makes one network
+call from `(t, r) = (1, 0)` and adds no reverse-process noise.
+
 <b>Refinement Network:</b>
 
 To prepare the data for training the refinement network, you first need to generate diffusion sketches and save them into the input dictionaries by running:

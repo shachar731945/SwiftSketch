@@ -176,21 +176,33 @@ def main():
         if args.guidance_param != 1:
             scale = torch.ones(final_batch_size, device=dist_util.dev()) * args.guidance_param
         
-        sample_fn = diffusion.p_sample_loop
-
-        sample = sample_fn(
-            model,
-            (final_batch_size, args.num_paths, model.ncpoints, model.nfeats),  
-            noise=None,
-            clip_denoised=False,
-            image_features= image_features,
-            scale= scale,
-            progress=True,
-            skip_timesteps=0,  # 0 is the default value - i.e. don't skip any step
-            init_image=None,
-            dump_steps=None,  
-            const_noise=False,
+        sample_shape = (
+            final_batch_size, args.num_paths, model.ncpoints, model.nfeats
         )
+        if args.diffusion_mode == "cfm_ddim":
+            sample = diffusion.cfm_ddim_sample_loop(
+                model,
+                sample_shape,
+                image_features=image_features,
+                num_steps=args.cfm_sampling_steps,
+                noise=None,
+                scale=scale,
+                progress=True,
+            )
+        else:
+            sample = diffusion.p_sample_loop(
+                model,
+                sample_shape,
+                noise=None,
+                clip_denoised=False,
+                image_features=image_features,
+                scale=scale,
+                progress=True,
+                skip_timesteps=0,  # use every legacy DDPM step
+                init_image=None,
+                dump_steps=None,
+                const_noise=False,
+            )
               
         if target_is_dict and args.save_diffusion_sketch_in_dict:
             # Save diffusion SVG sketches in the input dictionaries for
@@ -258,4 +270,3 @@ if __name__ == "__main__":
     # pydiffvg.set_device(args.device)
     pydiffvg.set_device(torch.device("cpu"))
     main()
-

@@ -17,10 +17,20 @@ class ClassifierFreeSampleModel(nn.Module):
         self.cond_mode = self.model.cond_mode   
       
 
-    def forward(self, x, timesteps, image_features, scale):
+    def forward(self, x, timesteps, image_features, scale, end_timesteps=None):
         cond_mode = self.model.cond_mode
         assert cond_mode in ['image']
-        out = self.model(x, timesteps, image_features)
-        out_uncond = self.model(x, timesteps, image_features, uncond=True)
+        out = self.model(
+            x,
+            timesteps,
+            image_features,
+            end_timesteps=end_timesteps,
+        )
+        out_uncond = self.model(
+            x,
+            timesteps,
+            image_features,
+            end_timesteps=end_timesteps,
+            uncond=True,
+        )
         return out_uncond + (scale.view(-1, 1, 1, 1) * (out - out_uncond))
-

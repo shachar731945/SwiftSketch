@@ -139,6 +139,17 @@ class GaussianDiffusion:
         self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
         self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
 
+        # CFM uses a normalized continuous clock with x_0 equal to clean data.
+        # The DDPM schedule table begins after its first noising increment, so
+        # prepend alpha_bar(0)=1 for the clean endpoint.
+        self.cfm_log_alphas_cumprod = th.from_numpy(
+            np.log(np.concatenate(([1.0], self.alphas_cumprod)))
+        ).float()
+        self.cfm_betas = th.from_numpy(
+            np.concatenate(([self.betas[0]], self.betas))
+        ).float()
+        self.cfm_numerical_eps = 1e-10
+
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
         self.posterior_variance = (
@@ -157,7 +168,10 @@ class GaussianDiffusion:
             * np.sqrt(alphas)
             / (1.0 - self.alphas_cumprod)
         )
-        if not hasattr(self.args, 'generate'): #do it only in training 
+        if (not hasattr(self.args, 'generate')
+                and getattr(self.args, "diffusion_mode", "ddpm") != "cfm_ddim"):
+            # The baseline loss owns a frozen VGG network. Pure CFM training
+            # deliberately does not instantiate or use it.
             self.loss_func = Loss(args)
 
        
@@ -256,6 +270,295 @@ class GaussianDiffusion:
             + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
             * noise
         )
+
+    # ------------------------------------------------------------------
+    # Cumulative-flow DDIM helpers. These are separate from the legacy
+    # discrete DDPM path so existing training and checkpoints remain intact.
+
+    @staticmethod
+    def _expand_batch_values(values, reference):
+        """Expand one scalar per batch item to the rank of ``reference``."""
+        return values.reshape(values.shape[0], *([1] * (reference.ndim - 1)))
+
+    @staticmethod
+    def _interpolate_schedule(values, times, maximum_time):
+        """Piecewise-linearly interpolate a 1-D schedule at float times."""
+        times = times.to(dtype=th.float32).clamp(0.0, float(maximum_time))
+        values = values.to(device=times.device, dtype=times.dtype)
+        lower = th.floor(times).long()
+        upper = th.ceil(times).long()
+        fraction = times - lower.to(times.dtype)
+        return values[lower] + fraction * (values[upper] - values[lower])
+
+    def cfm_alpha_bar_at(self, times):
+        """Continuous alpha-bar with alpha_bar(0)=1 at the clean endpoint."""
+        schedule_times = times * self.num_timesteps
+        log_alpha_bar = self._interpolate_schedule(
+            self.cfm_log_alphas_cumprod, schedule_times, self.num_timesteps
+        )
+        return th.exp(log_alpha_bar)
+
+    def cfm_beta_at(self, times):
+        """Continuous interpolation of beta in the clean-data-zero CFM clock."""
+        schedule_times = times * self.num_timesteps
+        return self._interpolate_schedule(
+            self.cfm_betas, schedule_times, self.num_timesteps
+        )
+
+    def q_sample_cfm(self, x_0, times, noise=None):
+        """Sample a noisy CFM state from clean control points x_0."""
+        if noise is None:
+            noise = th.randn_like(x_0)
+        if noise.shape != x_0.shape:
+            raise ValueError("CFM noise must have the same shape as x_0.")
+        alpha_bar = self._expand_batch_values(
+            self.cfm_alpha_bar_at(times), x_0
+        )
+        return th.sqrt(alpha_bar) * x_0 + th.sqrt(
+            th.clamp(1.0 - alpha_bar, min=0.0)
+        ) * noise
+
+    def calculate_cfm_k(self, alpha_bar_t, alpha_bar_r, same_time=None):
+        """Return the paper's scalar K(t,r), one value per batch item."""
+        numerator = th.sqrt(th.clamp(1.0 - alpha_bar_t, min=0.0)) * th.sqrt(
+            th.clamp(alpha_bar_r, min=self.cfm_numerical_eps)
+        )
+        denominator = th.sqrt(
+            th.clamp(1.0 - alpha_bar_r, min=self.cfm_numerical_eps)
+        ) * th.sqrt(th.clamp(alpha_bar_t, min=self.cfm_numerical_eps))
+        coefficient_k = numerator / denominator - 1.0
+        if same_time is not None:
+            coefficient_k = th.where(
+                same_time.to(dtype=th.bool),
+                th.zeros_like(coefficient_k),
+                coefficient_k,
+            )
+        return coefficient_k
+
+    def calculate_cfm_state_tangent(self, x_0, x_t, alpha_bar_t):
+        """Return v_x = sqrt(alpha_bar_t) x_0 - alpha_bar_t x_t."""
+        alpha_bar_t = self._expand_batch_values(alpha_bar_t, x_0)
+        return th.sqrt(alpha_bar_t) * x_0 - alpha_bar_t * x_t
+
+    def calculate_cfm_time_coefficient(self, alpha_bar_t, beta_t):
+        """Return the coefficient multiplying the active CFM time derivative.
+
+        Public CFM time is normalized to s in [0, 1]. The DDIM coefficient is
+        first expressed per internal schedule increment, so its JVP factor is
+        divided by the number of schedule samples. This keeps the target
+        stable when the same noise curve is discretized more finely.
+        """
+        coefficient = (
+            2.0
+            * (1.0 - alpha_bar_t)
+            * (1.0 - beta_t)
+            / th.clamp(beta_t, min=self.cfm_numerical_eps)
+        )
+        return coefficient / self.num_timesteps
+
+    def predict_cfm_and_calculate_d(
+        self,
+        model,
+        x_t,
+        time_t,
+        time_r,
+        image_features,
+        state_tangent,
+        time_coefficient,
+    ):
+        """Return the network prediction and D using one joint JVP.
+
+        D = J_x f v_x - c_t partial_t f. The endpoint tangent is zero,
+        because r is held fixed in this directional derivative.
+        """
+
+        def model_at(state, current_time, endpoint_time):
+            return model(
+                x=state,
+                timesteps=current_time,
+                end_timesteps=endpoint_time,
+                image_features=image_features,
+            )
+
+        # PyTorch 2.3's fused SDPA kernels do not implement forward AD.
+        # Restrict only this JVP evaluation to the differentiable math kernel;
+        # baseline DDPM and CFM inference retain their normal kernel choice.
+        with th.nn.attention.sdpa_kernel(th.nn.attention.SDPBackend.MATH):
+            prediction, derivative_d = th.func.jvp(
+                model_at,
+                (x_t, time_t, time_r),
+                (
+                    state_tangent,
+                    -time_coefficient,
+                    th.zeros_like(time_r),
+                ),
+            )
+        return prediction, derivative_d
+
+    @staticmethod
+    def build_stopped_cfm_target(x_0, coefficient_k, derivative_d):
+        """Build sg(x_0 + K D), with no gradient path through the target."""
+        coefficient_k = GaussianDiffusion._expand_batch_values(
+            coefficient_k, x_0
+        )
+        return (x_0 + coefficient_k * derivative_d).detach()
+
+    def calculate_cfm_ddim_loss(
+        self,
+        prediction,
+        x_0,
+        alpha_bar_t,
+        alpha_bar_r,
+        derivative_d,
+        time_t,
+        time_r,
+    ):
+        """Pure tensor loss: no model is accepted or evaluated here."""
+        coefficient_k = self.calculate_cfm_k(
+            alpha_bar_t,
+            alpha_bar_r,
+            same_time=th.isclose(time_t, time_r),
+        )
+        stopped_target = self.build_stopped_cfm_target(
+            x_0, coefficient_k, derivative_d
+        )
+        per_example_mse = (prediction - stopped_target).square().flatten(1).mean(1)
+        return {
+            "cfm_ddim": per_example_mse,
+            "loss": per_example_mse * self.args.cfm_loss_weight,
+            "cfm_k_abs": coefficient_k.detach().abs(),
+            "cfm_d_rms": derivative_d.detach().square().flatten(1).mean(1).sqrt(),
+        }
+
+    def training_cfm_ddim_losses(
+        self,
+        model,
+        x_0,
+        image_features,
+        time_t,
+        time_r,
+        noise=None,
+    ):
+        """Calculate the CFM prediction/JVP first, then call the tensor loss."""
+        if self.model_mean_type != ModelMeanType.START_X:
+            raise ValueError("CFM-DDIM currently supports only x_0 prediction.")
+
+        time_t = time_t.to(device=x_0.device, dtype=th.float32)
+        time_r = time_r.to(device=x_0.device, dtype=th.float32)
+        if th.any(time_r > time_t):
+            raise ValueError("Every CFM endpoint r must satisfy r <= t.")
+        if noise is None:
+            noise = th.randn_like(x_0)
+
+        x_t = self.q_sample_cfm(x_0, time_t, noise=noise)
+        alpha_bar_t = self.cfm_alpha_bar_at(time_t)
+        alpha_bar_r = self.cfm_alpha_bar_at(time_r)
+        beta_t = self.cfm_beta_at(time_t)
+        state_tangent = self.calculate_cfm_state_tangent(
+            x_0, x_t, alpha_bar_t
+        )
+        time_coefficient = self.calculate_cfm_time_coefficient(
+            alpha_bar_t, beta_t
+        )
+
+        prediction, derivative_d = self.predict_cfm_and_calculate_d(
+            model,
+            x_t,
+            time_t,
+            time_r,
+            image_features,
+            state_tangent,
+            time_coefficient,
+        )
+        # D is a self-estimated target component. Stop its graph before it
+        # crosses the prediction/JVP boundary into the pure loss function;
+        # build_stopped_cfm_target also detaches the complete target as a
+        # defensive guarantee.
+        stopped_derivative_d = derivative_d.detach()
+        losses = self.calculate_cfm_ddim_loss(
+            prediction,
+            x_0,
+            alpha_bar_t,
+            alpha_bar_r,
+            stopped_derivative_d,
+            time_t,
+            time_r,
+        )
+        losses["cfm_time_coefficient_abs"] = time_coefficient.detach().abs()
+        return losses
+
+    def ddim_cumulative_step(self, x_t, x_hat_t_to_r, time_t, time_r):
+        """Apply the deterministic cumulative DDIM map F(x_hat, x_t, t, r)."""
+        alpha_bar_t = self._expand_batch_values(
+            self.cfm_alpha_bar_at(time_t), x_t
+        )
+        alpha_bar_r = self._expand_batch_values(
+            self.cfm_alpha_bar_at(time_r), x_t
+        )
+        predicted_noise = (
+            x_t - th.sqrt(alpha_bar_t) * x_hat_t_to_r
+        ) / th.sqrt(
+            th.clamp(1.0 - alpha_bar_t, min=self.cfm_numerical_eps)
+        )
+        mapped = (
+            th.sqrt(alpha_bar_r) * x_hat_t_to_r
+            + th.sqrt(th.clamp(1.0 - alpha_bar_r, min=0.0)) * predicted_noise
+        )
+        same_time = self._expand_batch_values(
+            th.isclose(time_t, time_r), x_t
+        )
+        return th.where(same_time, x_t, mapped)
+
+    def cfm_ddim_sample_loop(
+        self,
+        model,
+        shape,
+        image_features,
+        num_steps,
+        noise=None,
+        scale=None,
+        device=None,
+        progress=False,
+    ):
+        """Generate with exactly ``num_steps`` deterministic CFM-DDIM hops."""
+        if not 1 <= num_steps <= self.num_timesteps:
+            raise ValueError("CFM sampling steps must be in [1, diffusion_steps].")
+        if device is None:
+            device = next(model.parameters()).device
+        if noise is None:
+            current = th.randn(*shape, device=device)
+        else:
+            if tuple(noise.shape) != tuple(shape):
+                raise ValueError("Initial CFM noise shape does not match requested shape.")
+            current = noise.to(device)
+
+        time_grid = th.linspace(
+            1.0,
+            0.0,
+            num_steps + 1,
+            device=device,
+            dtype=th.float32,
+        )
+        hop_indices = range(num_steps)
+        if progress:
+            from tqdm.auto import tqdm
+            hop_indices = tqdm(hop_indices)
+
+        with th.no_grad():
+            for hop in hop_indices:
+                time_t = time_grid[hop].expand(shape[0])
+                time_r = time_grid[hop + 1].expand(shape[0])
+                prediction = model(
+                    x=current,
+                    timesteps=time_t,
+                    end_timesteps=time_r,
+                    image_features=image_features,
+                    scale=scale,
+                )
+                current = self.ddim_cumulative_step(
+                    current, prediction, time_t, time_r
+                )
+        return current
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
         """

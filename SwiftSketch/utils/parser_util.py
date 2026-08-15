@@ -26,6 +26,15 @@ def parse_and_load_from_model(parser):
     with open(args_path, 'r') as fr:
         model_args = json.load(fr)
 
+    if (
+        model_args.get("diffusion_mode") == "cfm_ddim"
+        and model_args.get("cfm_time_version") != 2
+    ):
+        raise ValueError(
+            "This CFM checkpoint predates the normalized-time CFM "
+            "implementation and is intentionally unsupported."
+        )
+
     for a in args_to_overwrite:
         if a in model_args.keys():
             setattr(args, a, model_args[a])
@@ -81,6 +90,9 @@ def add_base_options(parser):
 
 def add_diffusion_options(parser):
     group = parser.add_argument_group('diffusion')
+    group.add_argument("--diffusion_mode", default="ddpm",
+                       choices=["ddpm", "cfm_ddim"], type=str,
+                       help="Use the legacy DDPM objective/sampler or the cumulative-flow DDIM objective.")
     group.add_argument("--noise_schedule", default='cosine', choices=['linear', 'cosine'], type=str,
                        help="Noise schedule type")
     group.add_argument("--cos_power", default=0.4 , type=float,
@@ -90,6 +102,10 @@ def add_diffusion_options(parser):
     group.add_argument("--sigma_small", default=True, type=bool, help="Use smaller sigma values.")
     group.add_argument("--model_mean_type", default='start_x',choices=['start_x', 'epsilon'], type=str, 
                        help="what is the model prediction.")
+    group.add_argument("--cfm_instantaneous_prob", default=0.5, type=float,
+                       help="Probability of replacing the CFM endpoint r with t during training.")
+    group.add_argument("--cfm_loss_weight", default=1.0, type=float,
+                       help="Multiplier for the pure CFM-DDIM MSE objective.")
 
     
 
@@ -200,6 +216,8 @@ def add_training_options(parser):
                        help="Training will stop after the specified number of steps.")
     group.add_argument("--resume_checkpoint", default="", type=str,
                        help="If not empty, will start from the specified checkpoint (path to model###.pt file).")
+    group.add_argument("--init_checkpoint", default="", type=str,
+                       help="Initialize model weights only from a checkpoint; starts with a fresh optimizer and step 0.")
     group.add_argument("--sort_by", default="no_sorting", type=str, 
                        choices=["highest_point", "length", "contour_and_attn", "no_sorting"],
                        help="sorting criterion for the data. ")
@@ -230,6 +248,8 @@ def add_generate_options(parser):
                        help="If 1 and the input is a dict, save the diffusion process SVG into the input dict.")
     group.add_argument("--refine_model_path", default='',  type=str,
                        help="Path to refine model####.pt file to be sampled.")
+    group.add_argument("--cfm_sampling_steps", default=1, type=int,
+                       help="Number of deterministic cumulative DDIM hops for a CFM checkpoint.")
     
    
  
@@ -254,6 +274,28 @@ def train_args():
     add_wandb_options(parser)
 
     args = parser.parse_args()
+    if args.diffusion_mode == "cfm_ddim":
+        # Persist a checkpoint-format marker. Generation and resume reject
+        # earlier CFM checkpoint formats rather than interpreting them with
+        # normalized-time semantics.
+        args.cfm_time_version = 2
+        if args.model_mean_type != "start_x":
+            parser.error("--diffusion_mode cfm_ddim currently requires --model_mean_type start_x.")
+        if args.diffusion_steps < 2:
+            parser.error("--diffusion_mode cfm_ddim requires --diffusion_steps of at least 2.")
+        if not 0.0 <= args.cfm_instantaneous_prob <= 1.0:
+            parser.error("--cfm_instantaneous_prob must be between 0 and 1.")
+        if args.cfm_loss_weight <= 0:
+            parser.error("--cfm_loss_weight must be positive.")
+        if args.lpips_weight or args.l1_points_weight:
+            print(
+                "CFM-DDIM uses its stopped-target L2 objective; forcing "
+                "--lpips_weight=0 and --l1_points_weight=0.", flush=True
+            )
+            args.lpips_weight = 0.0
+            args.l1_points_weight = 0.0
+    if args.init_checkpoint and args.resume_checkpoint:
+        parser.error("--init_checkpoint and --resume_checkpoint are mutually exclusive.")
     if args.lr_schedule == "exponential":
         lr_anneal_was_specified = any(
             argument == "--lr_anneal_steps" or argument.startswith("--lr_anneal_steps=")
@@ -275,5 +317,10 @@ def generate_args():
     add_generate_options(parser)
     args = parse_and_load_from_model(parser)
 
-    return args
+    if args.diffusion_mode == "cfm_ddim":
+        if args.model_mean_type != "start_x":
+            parser.error("CFM-DDIM generation requires a start_x checkpoint.")
+        if not 1 <= args.cfm_sampling_steps <= args.diffusion_steps:
+            parser.error("--cfm_sampling_steps must be between 1 and --diffusion_steps.")
 
+    return args

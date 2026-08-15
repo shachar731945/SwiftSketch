@@ -8,7 +8,8 @@ class SwiftSketch(nn.Module):
     def __init__(self,image_features_type= "CLIPMiddle_layer4",
                  latent_dim=256, ff_size=1024, num_layers=8, num_heads=4, dropout=0.1,
                  activation="gelu", normalize_model_output=0, 
-                 cond_mode="no_cond", cond_mask_prob=0, arch='trans_dec',  emb_trans_dec=0, scaling_factor=2):
+                 cond_mode="no_cond", cond_mask_prob=0, arch='trans_dec', emb_trans_dec=0,
+                 scaling_factor=2, diffusion_mode="ddpm"):
         super().__init__()
 
         print(f'initial SwiftSketch model', flush=True)
@@ -33,6 +34,7 @@ class SwiftSketch(nn.Module):
         self.scaling_factor= scaling_factor
         self.cond_mode = cond_mode
         self.cond_mask_prob = cond_mask_prob
+        self.diffusion_mode = diffusion_mode
 
         self.input_process = InputProcess( self.input_feats_dim , self.latent_dim) #define linear layer 
         self.sequence_pos_encoder = PositionalEncoding(self.latent_dim, self.dropout)
@@ -64,6 +66,11 @@ class SwiftSketch(nn.Module):
         
 
         self.embed_timestep = TimestepEmbedder(self.latent_dim, self.sequence_pos_encoder)
+        if self.diffusion_mode == "cfm_ddim":
+            self.embed_endpoint_timestep = TimestepEmbedder(
+                self.latent_dim, self.sequence_pos_encoder
+            )
+            self.initialize_endpoint_timestep()
 
         if self.cond_mode != 'no_cond': #cond_mode = 'image'
             if self.arch == 'trans_enc' or (self.arch == 'trans_dec' and self.emb_trans_dec):
@@ -92,14 +99,27 @@ class SwiftSketch(nn.Module):
 
 
 
-    def forward(self, x, timesteps, image_features=None, uncond=False, scale=None):
+    def initialize_endpoint_timestep(self):
+        """Make the endpoint embedding identical to the current-time embedding."""
+        if self.diffusion_mode == "cfm_ddim":
+            self.embed_endpoint_timestep.load_state_dict(
+                self.embed_timestep.state_dict()
+            )
+
+    def forward(self, x, timesteps, image_features=None, end_timesteps=None,
+                uncond=False, scale=None):
         """
         x: [batch_size, nstrokes, ncpoints, nfeats], denoted x_t in the paper
-        timesteps: [batch_size] (int)
+        timesteps: [batch_size] discrete DDPM indices or continuous CFM times
         """
         x = self.input_process(x) #linear layer + reshape  [nstrokes, bs, d]
 
         emb = self.embed_timestep(timesteps)  # [1,bs, d]
+        if self.diffusion_mode == "cfm_ddim":
+            if end_timesteps is None:
+                end_timesteps = timesteps
+            endpoint_emb = self.embed_endpoint_timestep(end_timesteps)
+            emb = 0.5 * (emb + endpoint_emb)
 
         force_mask = uncond #for cfg 
 
@@ -177,7 +197,30 @@ class TimestepEmbedder(nn.Module):
         )
 
     def forward(self, timesteps):
-        return self.time_embed(self.sequence_pos_encoder.pe[timesteps]).permute(1, 0, 2)
+        # Analytic form of PositionalEncoding.pe evaluated at arbitrary float
+        # times. At integer indices this reproduces the legacy table lookup,
+        # while retaining a meaningful derivative with respect to time.
+        timesteps = timesteps.to(dtype=torch.float32).reshape(-1)
+        frequencies = torch.exp(
+            torch.arange(
+                0,
+                self.latent_dim,
+                2,
+                device=timesteps.device,
+                dtype=timesteps.dtype,
+            )
+            * (-np.log(10000.0) / self.latent_dim)
+        )
+        angles = timesteps[:, None] * frequencies[None, :]
+        embedding = torch.stack((torch.sin(angles), torch.cos(angles)), dim=-1)
+        embedding = embedding.flatten(start_dim=1)
+        if embedding.shape[1] > self.latent_dim:
+            embedding = embedding[:, :self.latent_dim]
+        elif embedding.shape[1] < self.latent_dim:
+            embedding = torch.nn.functional.pad(
+                embedding, (0, self.latent_dim - embedding.shape[1])
+            )
+        return self.time_embed(embedding[:, None, :]).permute(1, 0, 2)
 
 
 class InputProcess(nn.Module):
@@ -283,10 +326,6 @@ class CLIPMiddle(nn.Module):
         x = x.reshape(x.size(0), -1) 
         x = self.fc(x)
         return x
-
-
-
-
 
 
 

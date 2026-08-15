@@ -112,11 +112,22 @@ class TrainLoop:
         elif self.init_checkpoint:
             print("init_checkpoint", self.init_checkpoint)
             logger.log(f"initializing refinement model weights from diffusion checkpoint: {self.init_checkpoint}...")
-            self.model.load_state_dict(
-                dist_util.load_state_dict(
-                    self.init_checkpoint, map_location=dist_util.dev()
-                )
+            state_dict = dist_util.load_state_dict(
+                self.init_checkpoint, map_location=dist_util.dev()
             )
+            missing_keys, unexpected_keys = self.model.load_state_dict(
+                state_dict, strict=False
+            )
+            disallowed_unexpected = [
+                key for key in unexpected_keys
+                if not key.startswith("embed_endpoint_timestep.")
+            ]
+            if missing_keys or disallowed_unexpected:
+                raise ValueError(
+                    "Diffusion-to-refinement initialization had incompatible "
+                    f"checkpoint keys. missing={missing_keys}, "
+                    f"unexpected={unexpected_keys}"
+                )
 
     def _load_optimizer_state(self):
         main_checkpoint = self._active_resume_checkpoint
