@@ -5,6 +5,66 @@ import json
 import sys
 
 
+def get_cfm_instantaneous_samples_per_example(
+    time_samples_per_example,
+    instantaneous_probability,
+    sample_count_argument="--cfm_time_samples_per_example",
+    probability_argument="--cfm_instantaneous_prob",
+):
+    """Return the exact instantaneous count, or ``None`` for legacy K=1 sampling."""
+    if time_samples_per_example < 1:
+        raise ValueError(f"{sample_count_argument} must be at least 1.")
+    if not 0.0 <= instantaneous_probability <= 1.0:
+        raise ValueError(f"{probability_argument} must be between 0 and 1.")
+
+    # K=1 is the backward-compatible mode: there is only one Bernoulli draw,
+    # so a non-trivial probability cannot be represented exactly per example.
+    if time_samples_per_example == 1:
+        return None
+
+    expected_count = time_samples_per_example * instantaneous_probability
+    instantaneous_count = round(expected_count)
+    if abs(expected_count - instantaneous_count) > 1e-9:
+        raise ValueError(
+            f"{sample_count_argument}={time_samples_per_example} cannot "
+            f"represent {probability_argument}={instantaneous_probability} "
+            "exactly. Choose a sample count whose product with the probability "
+            "is an integer."
+        )
+    return instantaneous_count
+
+
+def resolve_cfm_validation_sampling(
+    training_samples_per_example,
+    training_instantaneous_probability,
+    validation_samples_per_example,
+    validation_instantaneous_probability,
+):
+    """Resolve inherited CFM validation settings and enforce split availability."""
+    samples_per_example = (
+        training_samples_per_example
+        if validation_samples_per_example == 0
+        else validation_samples_per_example
+    )
+    instantaneous_probability = (
+        training_instantaneous_probability
+        if validation_instantaneous_probability is None
+        else validation_instantaneous_probability
+    )
+    get_cfm_instantaneous_samples_per_example(
+        samples_per_example,
+        instantaneous_probability,
+        sample_count_argument="--cfm_val_time_samples_per_example",
+        probability_argument="--cfm_val_instantaneous_prob",
+    )
+    if samples_per_example == 1 and 0.0 < instantaneous_probability < 1.0:
+        raise ValueError(
+            "The effective --cfm_val_time_samples_per_example must be at least "
+            "2 when --cfm_val_instantaneous_prob is strictly between 0 and 1."
+        )
+    return samples_per_example, instantaneous_probability
+
+
 
 def parse_and_load_from_model(parser):
     # args according to the loaded model
@@ -210,10 +270,18 @@ def add_training_options(parser):
                        help="Maximum validation batches per evaluation. Set to 0 to use the full validation set.")
     group.add_argument("--val_seed", default=1234, type=int,
                        help="Seed for deterministic validation timesteps and diffusion noise.")
+    group.add_argument("--cfm_val_time_samples_per_example", default=0, type=int,
+                       help="Independent CFM time/noise samples per validation example. "
+                            "Set to 0 to inherit --cfm_time_samples_per_example.")
+    group.add_argument("--cfm_val_instantaneous_prob", default=None, type=float,
+                       help="Validation probability for t=r. Omit to inherit --cfm_instantaneous_prob.")
     group.add_argument("--save_interval", default=10_000, type=int,
                        help="Save checkpoints each N steps")
     group.add_argument("--num_steps", default=60_000, type=int,
                        help="Training will stop after the specified number of steps.")
+    group.add_argument("--cfm_time_samples_per_example", default=1, type=int,
+                       help="Number of independent CFM (t, r, noise) samples evaluated in parallel per data example. "
+                            "Values above 1 must exactly represent --cfm_instantaneous_prob.")
     group.add_argument("--resume_checkpoint", default="", type=str,
                        help="If not empty, will start from the specified checkpoint (path to model###.pt file).")
     group.add_argument("--init_checkpoint", default="", type=str,
@@ -285,6 +353,20 @@ def train_args():
             parser.error("--diffusion_mode cfm_ddim requires --diffusion_steps of at least 2.")
         if not 0.0 <= args.cfm_instantaneous_prob <= 1.0:
             parser.error("--cfm_instantaneous_prob must be between 0 and 1.")
+        try:
+            get_cfm_instantaneous_samples_per_example(
+                args.cfm_time_samples_per_example,
+                args.cfm_instantaneous_prob,
+            )
+            if args.val_data_dir:
+                resolve_cfm_validation_sampling(
+                    args.cfm_time_samples_per_example,
+                    args.cfm_instantaneous_prob,
+                    args.cfm_val_time_samples_per_example,
+                    args.cfm_val_instantaneous_prob,
+                )
+        except ValueError as error:
+            parser.error(str(error))
         if args.cfm_loss_weight <= 0:
             parser.error("--cfm_loss_weight must be positive.")
         if args.lpips_weight or args.l1_points_weight:

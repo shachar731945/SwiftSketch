@@ -15,6 +15,10 @@ from diffusion import logger
 from utils import dist_util
 from diffusion.fp16_util import MixedPrecisionTrainer
 from diffusion.resample import LossAwareSampler, UniformSampler
+from utils.parser_util import (
+    get_cfm_instantaneous_samples_per_example,
+    resolve_cfm_validation_sampling,
+)
 
 
 class TrainLoop:
@@ -36,6 +40,26 @@ class TrainLoop:
         self.init_checkpoint = args.init_checkpoint
         self.diffusion_mode = args.diffusion_mode
         self.cfm_instantaneous_prob = args.cfm_instantaneous_prob
+        self.cfm_time_samples_per_example = getattr(
+            args, "cfm_time_samples_per_example", 1
+        )
+        self.cfm_val_time_samples_per_example = self.cfm_time_samples_per_example
+        self.cfm_val_instantaneous_prob = self.cfm_instantaneous_prob
+        if self.diffusion_mode == "cfm_ddim":
+            get_cfm_instantaneous_samples_per_example(
+                self.cfm_time_samples_per_example,
+                self.cfm_instantaneous_prob,
+            )
+            if self.validation_data is not None:
+                (
+                    self.cfm_val_time_samples_per_example,
+                    self.cfm_val_instantaneous_prob,
+                ) = resolve_cfm_validation_sampling(
+                    self.cfm_time_samples_per_example,
+                    self.cfm_instantaneous_prob,
+                    getattr(args, "cfm_val_time_samples_per_example", 0),
+                    getattr(args, "cfm_val_instantaneous_prob", None),
+                )
         self.use_fp16 = False  
         self.fp16_scale_growth = 1e-3  
         self.weight_decay = args.weight_decay
@@ -195,7 +219,7 @@ class TrainLoop:
                             continue
                         else:
                             if self.args.use_wandb:
-                                wandb.log({f'Loss/{k}': v}, step=self.step+self.resume_step)
+                                wandb.log({f'Train/{k}': v}, step=self.step+self.resume_step)
 
                 if self.validation_data is not None and self.step % self.val_interval == 0:
                     self.evaluate_validation(self.step + self.resume_step)
@@ -229,6 +253,10 @@ class TrainLoop:
         num_examples = 0
         num_batches = 0
         sample_index = 0
+        cfm_instantaneous_loss_total = 0.0
+        cfm_instantaneous_count = 0
+        cfm_cumulative_loss_total = 0.0
+        cfm_cumulative_count = 0
 
         try:
             with torch.no_grad():
@@ -246,30 +274,56 @@ class TrainLoop:
                     image_features = image_features.to(self.device)
 
                     batch_size = target_control_points.shape[0]
-                    noise = torch.randn(
-                        target_control_points.shape,
-                        dtype=target_control_points.dtype,
-                        device=self.device,
-                        generator=generator,
-                    )
-
                     if self.diffusion_mode == "cfm_ddim":
+                        cfm_target_control_points, cfm_image_features = (
+                            expand_cfm_training_batch(
+                                target_control_points,
+                                image_features,
+                                self.cfm_val_time_samples_per_example,
+                            )
+                        )
+                        # Keep the legacy K=1 validation RNG order: noise was
+                        # drawn before the CFM time pair.
+                        noise = torch.randn(
+                            cfm_target_control_points.shape,
+                            dtype=cfm_target_control_points.dtype,
+                            device=self.device,
+                            generator=generator,
+                        )
                         time_t, time_r = sample_cfm_time_pairs(
                             batch_size,
                             1.0,
-                            self.cfm_instantaneous_prob,
+                            self.cfm_val_instantaneous_prob,
                             self.device,
                             generator=generator,
+                            samples_per_example=self.cfm_val_time_samples_per_example,
                         )
                         losses = self.diffusion.training_cfm_ddim_losses(
                             self.model,
-                            target_control_points,
-                            image_features,
+                            cfm_target_control_points,
+                            cfm_image_features,
                             time_t,
                             time_r,
                             noise=noise,
                         )
+                        validation_losses = losses["loss"].detach().float()
+                        instantaneous = time_t == time_r
+                        cumulative = ~instantaneous
+                        cfm_instantaneous_loss_total += (
+                            validation_losses[instantaneous].sum().item()
+                        )
+                        cfm_instantaneous_count += instantaneous.sum().item()
+                        cfm_cumulative_loss_total += (
+                            validation_losses[cumulative].sum().item()
+                        )
+                        cfm_cumulative_count += cumulative.sum().item()
                     else:
+                        noise = torch.randn(
+                            target_control_points.shape,
+                            dtype=target_control_points.dtype,
+                            device=self.device,
+                            generator=generator,
+                        )
                         timesteps = (
                             torch.arange(sample_index, sample_index + batch_size, device=self.device)
                             % self.diffusion.num_timesteps
@@ -302,17 +356,30 @@ class TrainLoop:
         validation_metrics = {
             f"Validation/{key}": total / num_examples for key, total in totals.items()
         }
+        if self.diffusion_mode == "cfm_ddim":
+            validation_metrics.update(
+                calculate_cfm_validation_loss_metrics(
+                    cfm_instantaneous_loss_total,
+                    cfm_instantaneous_count,
+                    cfm_cumulative_loss_total,
+                    cfm_cumulative_count,
+                    self.cfm_val_instantaneous_prob,
+                )
+            )
         validation_metrics["Validation/num_examples"] = num_examples
         validation_metrics["Validation/num_batches"] = num_batches
 
         print(
-            "step[{}]: validation_loss[{:0.5f}]".format(
-                global_step, validation_metrics["Validation/loss"]
+            format_validation_console_message(
+                global_step,
+                validation_metrics,
+                self.diffusion_mode,
             ),
             flush=True,
         )
         if self.args.use_wandb:
             wandb.log(validation_metrics, step=global_step)
+        return validation_metrics
 
        
         
@@ -320,16 +387,24 @@ class TrainLoop:
     def forward_backward(self, target_rendered_images,target_control_points, image_features, step, resume_step):
         self.mp_trainer.zero_grad()
         if self.diffusion_mode == "cfm_ddim":
+            cfm_target_control_points, cfm_image_features = (
+                expand_cfm_training_batch(
+                    target_control_points,
+                    image_features,
+                    self.cfm_time_samples_per_example,
+                )
+            )
             time_t, time_r = sample_cfm_time_pairs(
                 target_control_points.shape[0],
                 1.0,
                 self.cfm_instantaneous_prob,
-                dist_util.dev(),
+                target_control_points.device,
+                samples_per_example=self.cfm_time_samples_per_example,
             )
             losses = self.diffusion.training_cfm_ddim_losses(
                 self.model,
-                target_control_points,
-                image_features,
+                cfm_target_control_points,
+                cfm_image_features,
                 time_t,
                 time_r,
             )
@@ -457,30 +532,155 @@ def log_loss_dict(diffusion, ts, losses):
         logger.logkv_mean(key, values.mean().item())
 
 
+def calculate_cfm_validation_loss_metrics(
+    instantaneous_loss_total,
+    instantaneous_count,
+    cumulative_loss_total,
+    cumulative_count,
+    instantaneous_probability,
+):
+    """Build CFM validation metrics, omitting unavailable split statistics."""
+    metrics = {}
+    instantaneous_loss = None
+    cumulative_loss = None
+
+    if instantaneous_count:
+        instantaneous_loss = instantaneous_loss_total / instantaneous_count
+        metrics["Validation/loss_instantaneous"] = instantaneous_loss
+    if cumulative_count:
+        cumulative_loss = cumulative_loss_total / cumulative_count
+        metrics["Validation/loss_cumulative"] = cumulative_loss
+
+    if instantaneous_loss is not None and cumulative_loss is not None:
+        metrics["Validation/loss"] = (
+            instantaneous_probability * instantaneous_loss
+            + (1.0 - instantaneous_probability) * cumulative_loss
+        )
+        metrics["Validation/loss_balanced"] = 0.5 * (
+            instantaneous_loss + cumulative_loss
+        )
+    elif instantaneous_loss is not None:
+        metrics["Validation/loss"] = instantaneous_loss
+    elif cumulative_loss is not None:
+        metrics["Validation/loss"] = cumulative_loss
+
+    return metrics
+
+
+def format_validation_console_message(global_step, validation_metrics, diffusion_mode):
+    """Format validation metrics without changing the DDPM console output."""
+    if diffusion_mode != "cfm_ddim":
+        return "step[{}]: validation_loss[{:0.5f}]".format(
+            global_step,
+            validation_metrics["Validation/loss"],
+        )
+
+    metric_labels = (
+        ("Validation/loss_instantaneous", "val_instantaneous"),
+        ("Validation/loss_cumulative", "val_cumulative"),
+        ("Validation/loss_balanced", "val_balanced"),
+        ("Validation/loss", "val_weighted"),
+    )
+    rendered_metrics = " ".join(
+        "{}[{:0.5f}]".format(label, validation_metrics[key])
+        for key, label in metric_labels
+        if key in validation_metrics
+    )
+    return "step[{}]: {}".format(global_step, rendered_metrics)
+
+
 def sample_cfm_time_pairs(
     batch_size,
     maximum_time,
     instantaneous_probability,
     device,
     generator=None,
+    samples_per_example=1,
 ):
-    """Sample ordered continuous CFM times with clean data at time zero."""
+    """Sample a flattened ``batch_size * K`` set of ordered CFM time pairs."""
+    instantaneous_count = get_cfm_instantaneous_samples_per_example(
+        samples_per_example,
+        instantaneous_probability,
+    )
     # Avoid the singular K coefficient exactly at the clean endpoint during
     # training. Inference is allowed to end at exactly zero.
     minimum_training_time = 1e-3
     random_times = torch.rand(
-        batch_size, 2, device=device, generator=generator, dtype=torch.float32
+        batch_size,
+        samples_per_example,
+        2,
+        device=device,
+        generator=generator,
+        dtype=torch.float32,
     )
     random_times = minimum_training_time + random_times * (
         float(maximum_time) - minimum_training_time
     )
-    time_t = random_times.max(dim=1).values
-    time_r = random_times.min(dim=1).values
-    instantaneous = torch.rand(
-        batch_size, device=device, generator=generator
-    ) < instantaneous_probability
+    time_t = random_times.max(dim=2).values
+    time_r = random_times.min(dim=2).values
+    if samples_per_example == 1:
+        instantaneous = torch.rand(
+            batch_size, 1, device=device, generator=generator
+        ) < instantaneous_probability
+    else:
+        # Randomize which K slots are instantaneous while keeping the exact
+        # requested count independently for every original data example.
+        random_order = torch.rand(
+            batch_size,
+            samples_per_example,
+            device=device,
+            generator=generator,
+        ).argsort(dim=1)
+        instantaneous = torch.zeros(
+            batch_size,
+            samples_per_example,
+            dtype=torch.bool,
+            device=device,
+        )
+        instantaneous.scatter_(
+            1,
+            random_order[:, :instantaneous_count],
+            True,
+        )
+
+    # Preserve the categorical distinction in finite precision. Two random
+    # cumulative times can very rarely be close enough for the CFM loss to
+    # treat them as the same time, so move only those pairs a negligible
+    # distance apart before setting the explicitly instantaneous pairs equal.
+    minimum_cumulative_gap = 1e-4
+    cumulative_too_close = (~instantaneous) & torch.isclose(time_t, time_r)
+    safe_time_t = torch.clamp(
+        time_t,
+        min=minimum_training_time + minimum_cumulative_gap,
+    )
+    safe_time_r = torch.minimum(
+        time_r,
+        safe_time_t - minimum_cumulative_gap,
+    )
+    time_t = torch.where(cumulative_too_close, safe_time_t, time_t)
+    time_r = torch.where(cumulative_too_close, safe_time_r, time_r)
     time_r = torch.where(instantaneous, time_t, time_r)
-    return time_t, time_r
+    return time_t.flatten(), time_r.flatten()
+
+
+def expand_cfm_training_batch(
+    target_control_points,
+    image_features,
+    samples_per_example,
+):
+    """Repeat batch-aligned CFM inputs and flatten the conceptual B x K batch."""
+    if samples_per_example == 1:
+        return target_control_points, image_features
+
+    expanded_targets = target_control_points.repeat_interleave(
+        samples_per_example, dim=0
+    )
+    expanded_features = None
+    if image_features is not None:
+        expanded_features = image_features.repeat_interleave(
+            samples_per_example, dim=0
+        )
+    return expanded_targets, expanded_features
 
 
 def log_cfm_time_pair_stats(time_t, time_r):
