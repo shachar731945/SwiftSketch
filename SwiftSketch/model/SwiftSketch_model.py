@@ -9,7 +9,8 @@ class SwiftSketch(nn.Module):
                  latent_dim=256, ff_size=1024, num_layers=8, num_heads=4, dropout=0.1,
                  activation="gelu", normalize_model_output=0, 
                  cond_mode="no_cond", cond_mask_prob=0, arch='trans_dec', emb_trans_dec=0,
-                 scaling_factor=2, diffusion_mode="ddpm"):
+                 scaling_factor=2, diffusion_mode="ddpm",
+                 cfm_time_embedding_scale=49.0):
         super().__init__()
 
         print(f'initial SwiftSketch model', flush=True)
@@ -35,6 +36,7 @@ class SwiftSketch(nn.Module):
         self.cond_mode = cond_mode
         self.cond_mask_prob = cond_mask_prob
         self.diffusion_mode = diffusion_mode
+        self.cfm_time_embedding_scale = cfm_time_embedding_scale
 
         self.input_process = InputProcess( self.input_feats_dim , self.latent_dim) #define linear layer 
         self.sequence_pos_encoder = PositionalEncoding(self.latent_dim, self.dropout)
@@ -106,6 +108,12 @@ class SwiftSketch(nn.Module):
                 self.embed_timestep.state_dict()
             )
 
+    def timestep_embedding_coordinate(self, timesteps):
+        """Map physical CFM time to the DDPM coordinate used by the embedder."""
+        if self.diffusion_mode == "cfm_ddim":
+            return timesteps * self.cfm_time_embedding_scale
+        return timesteps
+
     def forward(self, x, timesteps, image_features=None, end_timesteps=None,
                 uncond=False, scale=None):
         """
@@ -114,11 +122,17 @@ class SwiftSketch(nn.Module):
         """
         x = self.input_process(x) #linear layer + reshape  [nstrokes, bs, d]
 
-        emb = self.embed_timestep(timesteps)  # [1,bs, d]
+        embedding_timesteps = self.timestep_embedding_coordinate(timesteps)
+        emb = self.embed_timestep(embedding_timesteps)  # [1,bs, d]
         if self.diffusion_mode == "cfm_ddim":
             if end_timesteps is None:
                 end_timesteps = timesteps
-            endpoint_emb = self.embed_endpoint_timestep(end_timesteps)
+            endpoint_embedding_timesteps = self.timestep_embedding_coordinate(
+                end_timesteps
+            )
+            endpoint_emb = self.embed_endpoint_timestep(
+                endpoint_embedding_timesteps
+            )
             emb = 0.5 * (emb + endpoint_emb)
 
         force_mask = uncond #for cfg 
@@ -326,7 +340,6 @@ class CLIPMiddle(nn.Module):
         x = x.reshape(x.size(0), -1) 
         x = self.fc(x)
         return x
-
 
 
 

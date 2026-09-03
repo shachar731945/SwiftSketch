@@ -1,0 +1,7 @@
+1. Add diffusion steps in between in generation
+(what is predicted, what is the loss target (gt + a bit), what is the input)
+
+2. Add those visualization for the wandb logging itself
+
+3. Remove Loss from the logging, it has been renamed to Train
+and that's what it should be 

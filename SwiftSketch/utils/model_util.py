@@ -36,6 +36,9 @@ def get_model_args(args):
     normalize_model_output= args.normalize_model_output
     scaling_factor= args.scaling_factor
     diffusion_mode = getattr(args, "diffusion_mode", "ddpm")
+    cfm_time_embedding_scale = (
+        args.diffusion_steps - 1 if diffusion_mode == "cfm_ddim" else 1.0
+    )
 
 
     return { 'latent_dim': latent_dim, 'ff_size': ff_size, 'num_layers': num_layers, 'num_heads': num_heads,
@@ -43,7 +46,8 @@ def get_model_args(args):
             'cond_mask_prob':cond_mask_prob, 'image_features_type': image_features_type, 
             'normalize_model_output': normalize_model_output, 
             'arch': arch, 'emb_trans_dec': emb_trans_dec, 'scaling_factor': scaling_factor,
-            'diffusion_mode': diffusion_mode}
+            'diffusion_mode': diffusion_mode,
+            'cfm_time_embedding_scale': cfm_time_embedding_scale}
 
 
 def create_gaussian_diffusion(args):

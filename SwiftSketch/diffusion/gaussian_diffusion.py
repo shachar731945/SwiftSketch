@@ -7,11 +7,25 @@ https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0
 import torch
 import enum
 import math
+from contextlib import contextmanager
+
 import numpy as np
+import pydiffvg
 import torch as th
 from copy import deepcopy
 from utils.sketch_utils import rander_image_from_points, render_image_from_norm_points, log_model_prediction, log_diffusion_process_to_wandb
-from diffusion.Loss_computation import Loss
+from diffusion.Loss_computation import Loss, LPIPS
+
+
+@contextmanager
+def use_pydiffvg_device(device):
+    """Temporarily select the renderer device and restore its global state."""
+    previous_device = pydiffvg.get_device()
+    pydiffvg.set_device(torch.device(device))
+    try:
+        yield
+    finally:
+        pydiffvg.set_device(previous_device)
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1., cos_power=2):
     """
@@ -58,6 +72,26 @@ def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
         t2 = (i + 1) / num_diffusion_timesteps
         betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
     return np.array(betas)
+
+
+def sampling_snapshot_indices(total_steps, snapshot_count):
+    """Return evenly spaced post-step indices, always including the final step.
+
+    A sampling trajectory has ``total_steps`` post-step states.  This helper
+    deliberately does not include the initial pure-noise state: requesting
+    ``snapshot_count`` positions yields exactly that many trajectory states,
+    with the final one included.
+    """
+    if snapshot_count < 0:
+        raise ValueError("snapshot_count must be non-negative.")
+    if snapshot_count == 0:
+        return set()
+    if snapshot_count > total_steps:
+        raise ValueError("snapshot_count cannot exceed total sampling steps.")
+    return {
+        ((position + 1) * total_steps + snapshot_count - 1) // snapshot_count - 1
+        for position in range(snapshot_count)
+    }
 
 
 class ModelMeanType(enum.Enum):
@@ -168,11 +202,13 @@ class GaussianDiffusion:
             * np.sqrt(alphas)
             / (1.0 - self.alphas_cumprod)
         )
-        if (not hasattr(self.args, 'generate')
-                and getattr(self.args, "diffusion_mode", "ddpm") != "cfm_ddim"):
-            # The baseline loss owns a frozen VGG network. Pure CFM training
-            # deliberately does not instantiate or use it.
-            self.loss_func = Loss(args)
+        self.cfm_lpips_func = None
+        if not hasattr(self.args, 'generate'):
+            if getattr(self.args, "diffusion_mode", "ddpm") == "cfm_ddim":
+                if getattr(self.args, "lpips_weight", 0.0) > 0:
+                    self.cfm_lpips_func = LPIPS(args)
+            else:
+                self.loss_func = Loss(args)
 
        
 
@@ -424,11 +460,69 @@ class GaussianDiffusion:
         )
         per_example_mse = (prediction - stopped_target).square().flatten(1).mean(1)
         return {
-            "cfm_ddim": per_example_mse,
+            "cfm_ddim_loss": per_example_mse,
             "loss": per_example_mse * self.args.cfm_loss_weight,
             "cfm_k_abs": coefficient_k.detach().abs(),
             "cfm_d_rms": derivative_d.detach().square().flatten(1).mean(1).sqrt(),
         }
+
+    @staticmethod
+    def select_cfm_lpips_prediction(
+        model,
+        cfm_prediction,
+        x_t,
+        time_t,
+        time_r,
+        image_features,
+    ):
+        """Use t=r predictions directly and predict r=0 for cumulative rows."""
+        cumulative = ~th.isclose(time_t, time_r)
+        if not th.any(cumulative):
+            return cfm_prediction
+
+        terminal_prediction = model(
+            x=x_t[cumulative],
+            timesteps=time_t[cumulative],
+            end_timesteps=th.zeros_like(time_r[cumulative]),
+            image_features=(
+                None if image_features is None else image_features[cumulative]
+            ),
+        )
+        lpips_prediction = cfm_prediction.clone()
+        lpips_prediction[cumulative] = terminal_prediction
+        return lpips_prediction
+
+    def calculate_cfm_lpips_loss(
+        self,
+        prediction,
+        target_rendered_images,
+        mode,
+        render_device,
+    ):
+        """Render a precomputed prediction and calculate raw SwiftSketch LPIPS."""
+        if self.cfm_lpips_func is None:
+            raise ValueError("CFM LPIPS was requested without an LPIPS loss module.")
+        if target_rendered_images is None:
+            raise ValueError("CFM LPIPS requires rendered ground-truth sketches.")
+
+        canvas_points = prediction / self.args.scaling_factor
+        canvas_points = (canvas_points + 1.0) / 2.0
+        canvas_points = canvas_points * self.args.canvas_width
+        with use_pydiffvg_device(render_device):
+            rendered_prediction, _ = rander_image_from_points(
+                canvas_points,
+                self.args.canvas_width,
+                self.args.canvas_height,
+            )
+        rendered_prediction = rendered_prediction.permute(0, 3, 1, 2)
+        target_rendered_images = target_rendered_images.to(
+            rendered_prediction.device
+        ).detach()
+        return self.cfm_lpips_func(
+            rendered_prediction,
+            target_rendered_images,
+            mode=mode,
+        ).mean()
 
     def training_cfm_ddim_losses(
         self,
@@ -438,6 +532,9 @@ class GaussianDiffusion:
         time_t,
         time_r,
         noise=None,
+        target_rendered_images=None,
+        mode="train",
+        render_device=None,
     ):
         """Calculate the CFM prediction/JVP first, then call the tensor loss."""
         if self.model_mean_type != ModelMeanType.START_X:
@@ -485,6 +582,25 @@ class GaussianDiffusion:
             time_r,
         )
         losses["cfm_time_coefficient_abs"] = time_coefficient.detach().abs()
+        if self.cfm_lpips_func is not None:
+            lpips_prediction = self.select_cfm_lpips_prediction(
+                model,
+                prediction,
+                x_t,
+                time_t,
+                time_r,
+                image_features,
+            )
+            lpips_loss = self.calculate_cfm_lpips_loss(
+                lpips_prediction,
+                target_rendered_images,
+                mode,
+                x_0.device if render_device is None else render_device,
+            )
+            losses["lpips_loss"] = lpips_loss
+            losses["loss"] = (
+                losses["loss"] + self.args.lpips_weight * lpips_loss
+            )
         return losses
 
     def ddim_cumulative_step(self, x_t, x_hat_t_to_r, time_t, time_r):
@@ -519,12 +635,20 @@ class GaussianDiffusion:
         scale=None,
         device=None,
         progress=False,
+        return_intermediates=False,
+        intermediate_steps=0,
     ):
-        """Generate with exactly ``num_steps`` deterministic CFM-DDIM hops."""
+        """Generate with exactly ``num_steps`` deterministic CFM-DDIM hops.
+
+        When requested, return saved post-hop states and their corresponding
+        clean predictions alongside the final sample.  Saved tensors live on
+        CPU so they do not retain GPU memory during long trajectories.
+        """
         if not 1 <= num_steps <= self.num_timesteps:
             raise ValueError("CFM sampling steps must be in [1, diffusion_steps].")
+        snapshot_indices = sampling_snapshot_indices(num_steps, intermediate_steps)
         if device is None:
-            device = next(model.parameters()).device
+            device = next(iter(model.parameters())).device
         if noise is None:
             current = th.randn(*shape, device=device)
         else:
@@ -544,6 +668,7 @@ class GaussianDiffusion:
             from tqdm.auto import tqdm
             hop_indices = tqdm(hop_indices)
 
+        intermediates = []
         with th.no_grad():
             for hop in hop_indices:
                 time_t = time_grid[hop].expand(shape[0])
@@ -558,6 +683,15 @@ class GaussianDiffusion:
                 current = self.ddim_cumulative_step(
                     current, prediction, time_t, time_r
                 )
+                if hop in snapshot_indices:
+                    intermediates.append({
+                        "state": current.detach().cpu().clone(),
+                        "prediction": prediction.detach().cpu().clone(),
+                        "step": hop + 1,
+                        "total_steps": num_steps,
+                    })
+        if return_intermediates:
+            return current, intermediates
         return current
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
@@ -782,6 +916,8 @@ class GaussianDiffusion:
         init_image=None,
         dump_steps=None,
         const_noise=False,
+        return_intermediates=False,
+        intermediate_steps=0,
     ):
         """
         Generate samples from the model.
@@ -801,7 +937,12 @@ class GaussianDiffusion:
         :param const_noise: If True, will noise all samples with the same noise throughout sampling
         :return: a non-differentiable batch of samples.
         """
+        total_steps = self.num_timesteps - skip_timesteps
+        snapshot_indices = sampling_snapshot_indices(total_steps, intermediate_steps)
+        if return_intermediates and dump_steps is not None:
+            raise ValueError("dump_steps and return_intermediates cannot be used together.")
         final = None
+        intermediates = []
         if dump_steps is not None:
             dump = []
 
@@ -848,6 +989,13 @@ class GaussianDiffusion:
 
             if dump_steps is not None and i in dump_steps:
                 dump.append(deepcopy(out["sample"]))
+            if i in snapshot_indices:
+                intermediates.append({
+                    "state": out["sample"].detach().cpu().clone(),
+                    "prediction": out["pred_xstart"].detach().cpu().clone(),
+                    "step": i + 1,
+                    "total_steps": total_steps,
+                })
             final = out
         if dump_steps is not None:
             return dump
@@ -861,6 +1009,8 @@ class GaussianDiffusion:
             print("log Denoising Process")
             log_diffusion_process_to_wandb(timesteps[::-1], xt_Denoising_Process[::-1], x0_Denoising_Process[::-1], "Denoising Process Grid") 
 
+        if return_intermediates:
+            return final["sample"], intermediates
         return final["sample"]
 
     def p_sample_loop_progressive(
@@ -887,7 +1037,7 @@ class GaussianDiffusion:
         p_sample().
         """
         if device is None:
-            device = next(model.parameters()).device
+            device = next(iter(model.parameters())).device
         assert isinstance(shape, (tuple, list))
         if noise is not None:
             img = noise

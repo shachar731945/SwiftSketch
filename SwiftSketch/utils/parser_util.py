@@ -5,6 +5,9 @@ import json
 import sys
 
 
+CFM_TIME_VERSION = 3
+
+
 def get_cfm_instantaneous_samples_per_example(
     time_samples_per_example,
     instantaneous_probability,
@@ -88,10 +91,10 @@ def parse_and_load_from_model(parser):
 
     if (
         model_args.get("diffusion_mode") == "cfm_ddim"
-        and model_args.get("cfm_time_version") != 2
+        and model_args.get("cfm_time_version") != CFM_TIME_VERSION
     ):
         raise ValueError(
-            "This CFM checkpoint predates the normalized-time CFM "
+            "This CFM checkpoint uses an incompatible time-conditioning "
             "implementation and is intentionally unsupported."
         )
 
@@ -282,6 +285,29 @@ def add_training_options(parser):
     group.add_argument("--cfm_time_samples_per_example", default=1, type=int,
                        help="Number of independent CFM (t, r, noise) samples evaluated in parallel per data example. "
                             "Values above 1 must exactly represent --cfm_instantaneous_prob.")
+    group.add_argument("--media_interval", default=0, type=int,
+                       help="Generate CFM validation media each N training steps. 0 disables media generation.")
+    group.add_argument("--media_validation_files", default=[], nargs="+", type=str,
+                       help="Optional fixed .npy/.npz validation files used for media. "
+                            "When omitted, the first valid sorted file under --val_data_dir is used.")
+    group.add_argument("--media_seed", default=None, type=int,
+                       help="Seed for fixed media noise. Omit to inherit --val_seed.")
+    group.add_argument("--media_guidance_param", default=2.5, type=float,
+                       help="Classifier-free guidance scale used only for validation media generation.")
+    group.add_argument("--media_cfm_sampling_steps", default=[1, 4], nargs="+", type=int,
+                       help="CFM sampling step counts shown in validation media.")
+    group.add_argument("--media_instantaneous_times", default=[0.25, 0.5, 0.75, 1.0], nargs="+", type=float,
+                       help="Times t=r at which to show instantaneous clean predictions.")
+    group.add_argument("--media_log_at_start", default=1, choices=[0, 1], type=int,
+                       help="Log fixed validation media before the first optimizer update.")
+    group.add_argument("--media_output_mode", default="both",
+                       choices=["wandb", "disk", "both"], type=str,
+                       help="Write validation media to W&B, the run directory, or both.")
+    group.add_argument("--media_output_dir", default="", type=str,
+                       help="Media output directory. Empty uses <run save_dir>/media.")
+    group.add_argument("--validation_media_render_device", default="cpu",
+                       choices=["cpu", "model"], type=str,
+                       help="Render validation-media sketches on CPU or on the training model's device.")
     group.add_argument("--resume_checkpoint", default="", type=str,
                        help="If not empty, will start from the specified checkpoint (path to model###.pt file).")
     group.add_argument("--init_checkpoint", default="", type=str,
@@ -318,6 +344,12 @@ def add_generate_options(parser):
                        help="Path to refine model####.pt file to be sampled.")
     group.add_argument("--cfm_sampling_steps", default=1, type=int,
                        help="Number of deterministic cumulative DDIM hops for a CFM checkpoint.")
+    group.add_argument("--save_intermediate_steps", default=0, type=int,
+                       help="Save this many evenly spaced sampling positions (including the final position). "
+                            "0 keeps final-only generation.")
+    group.add_argument("--intermediate_output_type", default="both", type=str,
+                       choices=["both", "state", "prediction"],
+                       help="At each saved sampling position, write the current state, the predicted clean sketch, or both.")
     
    
  
@@ -342,40 +374,89 @@ def train_args():
     add_wandb_options(parser)
 
     args = parser.parse_args()
+    if args.media_interval < 0:
+        parser.error("--media_interval must be 0 or a positive integer.")
+    if args.media_interval:
+        if args.diffusion_mode != "cfm_ddim":
+            parser.error("Training validation media currently requires --diffusion_mode cfm_ddim.")
+        if not args.media_validation_files and not args.val_data_dir:
+            parser.error("Training validation media requires --media_validation_files or --val_data_dir.")
+        if args.media_output_mode == "wandb" and not args.use_wandb:
+            parser.error("--media_output_mode wandb requires --use_wandb 1.")
+        if not args.media_cfm_sampling_steps:
+            parser.error("--media_cfm_sampling_steps must contain at least one step count.")
+        if any(
+            step_count < 1 or step_count > args.diffusion_steps
+            for step_count in args.media_cfm_sampling_steps
+        ):
+            parser.error(
+                "Every --media_cfm_sampling_steps value must be between 1 and --diffusion_steps."
+            )
+        if not args.media_instantaneous_times:
+            parser.error("--media_instantaneous_times must contain at least one time.")
+        if any(time < 0.0 or time > 1.0 for time in args.media_instantaneous_times):
+            parser.error("Every --media_instantaneous_times value must be between 0 and 1.")
     if args.diffusion_mode == "cfm_ddim":
         # Persist a checkpoint-format marker. Generation and resume reject
-        # earlier CFM checkpoint formats rather than interpreting them with
-        # normalized-time semantics.
-        args.cfm_time_version = 2
+        # earlier CFM checkpoint formats rather than interpreting them with a
+        # different time-conditioning convention.
+        args.cfm_time_version = CFM_TIME_VERSION
         if args.model_mean_type != "start_x":
             parser.error("--diffusion_mode cfm_ddim currently requires --model_mean_type start_x.")
         if args.diffusion_steps < 2:
             parser.error("--diffusion_mode cfm_ddim requires --diffusion_steps of at least 2.")
         if not 0.0 <= args.cfm_instantaneous_prob <= 1.0:
             parser.error("--cfm_instantaneous_prob must be between 0 and 1.")
-        try:
-            get_cfm_instantaneous_samples_per_example(
-                args.cfm_time_samples_per_example,
-                args.cfm_instantaneous_prob,
+        cfm_lpips_enabled = args.lpips_weight > 0
+        if args.lpips_weight < 0:
+            parser.error("--lpips_weight must be non-negative.")
+        if args.l1_points_weight:
+            parser.error(
+                "CFM-DDIM does not use the L1 point loss; set --l1_points_weight 0."
             )
-            if args.val_data_dir:
-                resolve_cfm_validation_sampling(
+        if cfm_lpips_enabled:
+            if args.cfm_time_samples_per_example != 1:
+                parser.error(
+                    "CFM-DDIM with LPIPS requires --cfm_time_samples_per_example 1."
+                )
+            effective_val_samples = (
+                args.cfm_val_time_samples_per_example
+                or args.cfm_time_samples_per_example
+            )
+            if effective_val_samples != 1:
+                parser.error(
+                    "CFM-DDIM with LPIPS requires --cfm_val_time_samples_per_example "
+                    "0 or 1; validation evaluates every endpoint regime explicitly."
+                )
+            if args.normalize_model_output != 1:
+                parser.error(
+                    "CFM-DDIM with LPIPS requires --normalize_model_output 1 so the "
+                    "existing tanh output normalization bounds rendered points."
+                )
+            validation_probability = (
+                args.cfm_instantaneous_prob
+                if args.cfm_val_instantaneous_prob is None
+                else args.cfm_val_instantaneous_prob
+            )
+            if not 0.0 <= validation_probability <= 1.0:
+                parser.error("--cfm_val_instantaneous_prob must be between 0 and 1.")
+        else:
+            try:
+                get_cfm_instantaneous_samples_per_example(
                     args.cfm_time_samples_per_example,
                     args.cfm_instantaneous_prob,
-                    args.cfm_val_time_samples_per_example,
-                    args.cfm_val_instantaneous_prob,
                 )
-        except ValueError as error:
-            parser.error(str(error))
+                if args.val_data_dir:
+                    resolve_cfm_validation_sampling(
+                        args.cfm_time_samples_per_example,
+                        args.cfm_instantaneous_prob,
+                        args.cfm_val_time_samples_per_example,
+                        args.cfm_val_instantaneous_prob,
+                    )
+            except ValueError as error:
+                parser.error(str(error))
         if args.cfm_loss_weight <= 0:
             parser.error("--cfm_loss_weight must be positive.")
-        if args.lpips_weight or args.l1_points_weight:
-            print(
-                "CFM-DDIM uses its stopped-target L2 objective; forcing "
-                "--lpips_weight=0 and --l1_points_weight=0.", flush=True
-            )
-            args.lpips_weight = 0.0
-            args.l1_points_weight = 0.0
     if args.init_checkpoint and args.resume_checkpoint:
         parser.error("--init_checkpoint and --resume_checkpoint are mutually exclusive.")
     if args.lr_schedule == "exponential":
@@ -404,5 +485,17 @@ def generate_args():
             parser.error("CFM-DDIM generation requires a start_x checkpoint.")
         if not 1 <= args.cfm_sampling_steps <= args.diffusion_steps:
             parser.error("--cfm_sampling_steps must be between 1 and --diffusion_steps.")
+    if args.save_intermediate_steps < 0:
+        parser.error("--save_intermediate_steps must be 0 or a positive integer.")
+    sampling_steps = (
+        args.cfm_sampling_steps
+        if args.diffusion_mode == "cfm_ddim"
+        else args.diffusion_steps
+    )
+    if args.save_intermediate_steps > sampling_steps:
+        parser.error(
+            "--save_intermediate_steps cannot exceed the number of sampling "
+            "steps for the selected diffusion mode."
+        )
 
     return args

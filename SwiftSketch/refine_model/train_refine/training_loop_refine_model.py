@@ -277,8 +277,6 @@ class TrainLoop:
         validation_metrics = {
             f"Validation/{key}": total / num_examples for key, total in totals.items()
         }
-        validation_metrics["Validation/num_examples"] = num_examples
-        validation_metrics["Validation/num_batches"] = num_batches
 
         print(
             "step[{}]: validation_loss[{:0.5f}]".format(

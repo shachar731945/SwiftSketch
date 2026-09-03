@@ -17,6 +17,48 @@ from transformers import AutoModelForImageSegmentation
 import pydiffvg
 
 
+def save_intermediate_svgs(intermediates, image_names, output_dir, args):
+    """Render intermediate sampler states/predictions without changing final output."""
+    if not intermediates or not args.save_svg:
+        return
+    intermediate_root = os.path.join(output_dir, "intermediate_steps")
+    for intermediate in intermediates:
+        step = intermediate["step"]
+        total_steps = intermediate["total_steps"]
+        outputs = []
+        # The ordinary final SVG below occupies the final output slot (and is
+        # refined when refinement is enabled). Do not duplicate it here: N
+        # requested positions with ``both`` produce exactly 2*N SVGs total.
+        is_final_position = step == total_steps
+        if (
+            not is_final_position
+            and args.intermediate_output_type in ("both", "state")
+        ):
+            outputs.append(("state", intermediate["state"]))
+        if args.intermediate_output_type in ("both", "prediction"):
+            outputs.append(("prediction", intermediate["prediction"]))
+        for output_type, points in outputs:
+            denormalized_points = sketch_utils.denormalize_points(
+                points, args.scaling_factor, args.canvas_width
+            )
+            _, svg_contents = sketch_utils.rander_image_from_points(
+                denormalized_points,
+                args.canvas_width,
+                args.canvas_height,
+                return_svg_content=True,
+            )
+            for image_name, svg_content in zip(image_names, svg_contents):
+                image_root = os.path.join(
+                    intermediate_root, os.path.splitext(image_name)[0]
+                )
+                os.makedirs(image_root, exist_ok=True)
+                output_file = os.path.join(
+                    image_root, f"step_{step:04d}_of_{total_steps:04d}_{output_type}.svg"
+                )
+                with open(output_file, "w") as svg_file:
+                    svg_file.write(svg_content)
+
+
 def main():
     args = generate_args()
     fixseed(args.seed)
@@ -179,8 +221,9 @@ def main():
         sample_shape = (
             final_batch_size, args.num_paths, model.ncpoints, model.nfeats
         )
+        save_intermediates = args.save_intermediate_steps > 0
         if args.diffusion_mode == "cfm_ddim":
-            sample = diffusion.cfm_ddim_sample_loop(
+            sampling_result = diffusion.cfm_ddim_sample_loop(
                 model,
                 sample_shape,
                 image_features=image_features,
@@ -188,9 +231,11 @@ def main():
                 noise=None,
                 scale=scale,
                 progress=True,
+                return_intermediates=save_intermediates,
+                intermediate_steps=args.save_intermediate_steps,
             )
         else:
-            sample = diffusion.p_sample_loop(
+            sampling_result = diffusion.p_sample_loop(
                 model,
                 sample_shape,
                 noise=None,
@@ -202,7 +247,14 @@ def main():
                 init_image=None,
                 dump_steps=None,
                 const_noise=False,
+                return_intermediates=save_intermediates,
+                intermediate_steps=args.save_intermediate_steps,
             )
+        if save_intermediates:
+            sample, intermediates = sampling_result
+            save_intermediate_svgs(intermediates, images_files, output_path, args)
+        else:
+            sample = sampling_result
               
         if target_is_dict and args.save_diffusion_sketch_in_dict:
             # Save diffusion SVG sketches in the input dictionaries for
