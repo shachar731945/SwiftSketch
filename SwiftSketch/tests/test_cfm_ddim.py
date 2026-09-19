@@ -78,6 +78,22 @@ def make_ddpm_diffusion(num_steps=4):
     )
 
 
+def make_trainable_ddpm_diffusion(num_steps=4):
+    args = SimpleNamespace(
+        diffusion_mode="ddpm",
+        lpips_weight=0.0,
+        l1_points_weight=1.0,
+        clip_conv_weight=0.0,
+        use_wandb=0,
+    )
+    return GaussianDiffusion(
+        args=args,
+        betas=np.linspace(1e-3, 2e-2, num_steps),
+        model_mean_type=ModelMeanType.START_X,
+        model_var_type=ModelVarType.FIXED_SMALL,
+    )
+
+
 def make_normalized_cosine_diffusion(num_steps):
     args = SimpleNamespace(
         diffusion_mode="cfm_ddim",
@@ -160,7 +176,9 @@ class CFMDDIMTests(unittest.TestCase):
             "--cfm_time_samples_per_example",
             "1",
             "--cfm_val_time_samples_per_example",
-            "1",
+            "6",
+            "--cfm_val_instantaneous_fraction",
+            "0.5",
             "--normalize_model_output",
             "1",
             "--val_data_dir",
@@ -172,12 +190,14 @@ class CFMDDIMTests(unittest.TestCase):
         self.assertEqual(args.lpips_weight, 0.2)
         self.assertEqual(args.l1_points_weight, 0.0)
         self.assertEqual(args.cfm_time_samples_per_example, 1)
-        self.assertEqual(args.cfm_val_time_samples_per_example, 1)
+        self.assertEqual(args.cfm_val_time_samples_per_example, 6)
+        self.assertEqual(args.cfm_val_instantaneous_fraction, 0.5)
         self.assertEqual(args.normalize_model_output, 1)
 
         invalid_suffixes = (
             ["--cfm_time_samples_per_example", "2"],
-            ["--cfm_val_time_samples_per_example", "2"],
+            ["--cfm_val_time_samples_per_example", "5"],
+            ["--cfm_val_instantaneous_fraction", "1.1"],
             ["--normalize_model_output", "0"],
             ["--l1_points_weight", "1"],
         )
@@ -187,6 +207,30 @@ class CFMDDIMTests(unittest.TestCase):
             ), redirect_stderr(StringIO()):
                 with self.assertRaises(SystemExit):
                     train_args()
+
+    def test_old_validation_probability_argument_is_an_alias_for_fraction(self):
+        arguments = [
+            "train",
+            "--save_dir",
+            "unused",
+            "--diffusion_mode",
+            "cfm_ddim",
+            "--lpips_weight",
+            "0.2",
+            "--l1_points_weight",
+            "0",
+            "--cfm_val_time_samples_per_example",
+            "4",
+            "--cfm_val_instantaneous_prob",
+            "0.25",
+            "--val_data_dir",
+            "unused",
+        ]
+        with patch("sys.argv", arguments):
+            args = train_args()
+
+        self.assertEqual(args.cfm_val_instantaneous_fraction, 0.25)
+        self.assertFalse(hasattr(args, "cfm_val_instantaneous_prob"))
 
     def test_cfm_loads_lpips_only_when_its_weight_is_positive(self):
         with patch("diffusion.gaussian_diffusion.LPIPS") as lpips_constructor:
@@ -675,6 +719,28 @@ class CFMDDIMTests(unittest.TestCase):
         self.assertEqual(len(intermediates), 4)
         self.assertEqual([item["step"] for item in intermediates], [1, 2, 3, 4])
         self.assertTrue(torch.equal(final.cpu(), intermediates[-1]["state"]))
+
+    def test_ddpm_training_loss_and_backprop_path_are_unchanged(self):
+        diffusion = make_trainable_ddpm_diffusion(num_steps=4)
+        model = CountingModel()
+        target_points = torch.randn(2, 3, 4, 2)
+
+        losses = diffusion.training_losses(
+            model,
+            target_points,
+            torch.zeros(2, 3, 8, 8),
+            image_features=None,
+            t=torch.tensor([0, 3]),
+            step=1,
+            resume_step=0,
+        )
+
+        self.assertEqual(set(losses), {"L1_points", "loss"})
+        self.assertTrue(torch.isfinite(losses["loss"]))
+        losses["loss"].backward()
+        self.assertIsNotNone(model.weight.grad)
+        self.assertTrue(torch.isfinite(model.weight.grad))
+
     def test_time_sample_count_requires_an_exact_instantaneous_ratio(self):
         self.assertIsNone(
             get_cfm_instantaneous_samples_per_example(1, 0.5)
@@ -705,12 +771,13 @@ class CFMDDIMTests(unittest.TestCase):
             "unused",
             "--cfm_val_time_samples_per_example",
             "1",
-            "--cfm_val_instantaneous_prob",
+            "--cfm_val_instantaneous_fraction",
             "0.5",
         ]
         with patch("sys.argv", common_arguments + ["--diffusion_mode", "ddpm"]):
             ddpm_args = train_args()
         self.assertEqual(ddpm_args.cfm_val_time_samples_per_example, 1)
+        self.assertEqual(ddpm_args.cfm_val_instantaneous_fraction, 0.5)
 
         with patch(
             "sys.argv",
@@ -777,7 +844,7 @@ class CFMDDIMTests(unittest.TestCase):
             instantaneous_count=2,
             cumulative_loss_total=12.0,
             cumulative_count=3,
-            instantaneous_probability=0.25,
+            instantaneous_fraction=0.25,
         )
         self.assertEqual(metrics["Validation/loss_instantaneous"], 2.0)
         self.assertEqual(metrics["Validation/loss_cumulative"], 4.0)
@@ -789,7 +856,7 @@ class CFMDDIMTests(unittest.TestCase):
             instantaneous_count=2,
             cumulative_loss_total=12.0,
             cumulative_count=3,
-            instantaneous_probability=0.5,
+            instantaneous_fraction=0.5,
         )
         self.assertEqual(
             equal_weight_metrics["Validation/loss"],
@@ -802,8 +869,9 @@ class CFMDDIMTests(unittest.TestCase):
             cfm_cumulative_total=8.0,
             lpips_instantaneous_total=6.0,
             lpips_terminal_total=10.0,
-            num_examples=2,
-            instantaneous_probability=0.25,
+            instantaneous_count=2,
+            cumulative_count=2,
+            instantaneous_fraction=0.25,
             cfm_weight=1.0,
             lpips_weight=0.2,
         )
@@ -815,13 +883,33 @@ class CFMDDIMTests(unittest.TestCase):
         self.assertEqual(metrics["Validation/loss"], 4.4)
         self.assertEqual(metrics["Validation/loss_balanced"], 3.8)
 
+        instantaneous_only = calculate_cfm_lpips_validation_metrics(
+            cfm_instantaneous_total=4.0,
+            cfm_cumulative_total=0.0,
+            lpips_instantaneous_total=6.0,
+            lpips_terminal_total=0.0,
+            instantaneous_count=2,
+            cumulative_count=0,
+            instantaneous_fraction=1.0,
+            cfm_weight=1.0,
+            lpips_weight=0.2,
+        )
+        self.assertEqual(
+            instantaneous_only,
+            {
+                "Validation/cfm_instantaneous_loss": 2.0,
+                "Validation/lpips_instantaneous_loss": 3.0,
+                "Validation/loss": 2.6,
+            },
+        )
+
     def test_cfm_validation_metrics_omit_unavailable_regimes(self):
         instantaneous_only = calculate_cfm_validation_loss_metrics(
             instantaneous_loss_total=6.0,
             instantaneous_count=2,
             cumulative_loss_total=0.0,
             cumulative_count=0,
-            instantaneous_probability=1.0,
+            instantaneous_fraction=1.0,
         )
         self.assertEqual(
             instantaneous_only,
@@ -836,7 +924,7 @@ class CFMDDIMTests(unittest.TestCase):
             instantaneous_count=0,
             cumulative_loss_total=8.0,
             cumulative_count=2,
-            instantaneous_probability=0.0,
+            instantaneous_fraction=0.0,
         )
         self.assertEqual(
             cumulative_only,
@@ -908,6 +996,25 @@ class CFMDDIMTests(unittest.TestCase):
             ],
         )
 
+    def test_ddpm_training_logging_retains_every_legacy_loss(self):
+        losses = {
+            "LPIPS": torch.tensor(2.0),
+            "L1_points": torch.tensor(3.0),
+            "loss": torch.tensor(5.0),
+        }
+
+        with patch("train.training_loop.logger.logkv_mean") as logkv_mean:
+            log_loss_dict(None, None, losses)
+
+        self.assertEqual(
+            logkv_mean.call_args_list,
+            [
+                call("LPIPS", 2.0),
+                call("L1_points", 3.0),
+                call("loss", 5.0),
+            ],
+        )
+
     def test_cfm_lpips_validation_evaluates_every_regime_on_cpu(self):
         class ValidationLossDiffusion:
             def __init__(self):
@@ -927,7 +1034,14 @@ class CFMDDIMTests(unittest.TestCase):
             ):
                 instantaneous = torch.equal(time_t, time_r)
                 inner_self.calls.append(
-                    (instantaneous, mode, render_device, target_rendered_images.shape)
+                    (
+                        instantaneous,
+                        mode,
+                        render_device,
+                        target_rendered_images.shape,
+                        time_t.detach().clone(),
+                        time_r.detach().clone(),
+                    )
                 )
                 batch_size = target_control_points.shape[0]
                 return {
@@ -937,7 +1051,9 @@ class CFMDDIMTests(unittest.TestCase):
                     "lpips_loss": torch.tensor(3.0 if instantaneous else 5.0),
                     "loss": torch.zeros(batch_size),
                     "cfm_k_abs": torch.zeros(batch_size),
-                    "cfm_d_rms": torch.zeros(batch_size),
+                    "cfm_d_rms": torch.full(
+                        (batch_size,), 10.0 if instantaneous else 20.0
+                    ),
                     "cfm_time_coefficient_abs": torch.zeros(batch_size),
                 }
 
@@ -957,8 +1073,8 @@ class CFMDDIMTests(unittest.TestCase):
         loop.device = torch.device("cpu")
         loop.val_max_batches = 0
         loop.val_seed = 1234
-        loop.cfm_val_time_samples_per_example = 1
-        loop.cfm_val_instantaneous_prob = 0.25
+        loop.cfm_val_time_samples_per_example = 6
+        loop.cfm_val_instantaneous_fraction = 0.5
         loop.resume_step = 0
         loop.args = SimpleNamespace(
             use_wandb=0,
@@ -971,19 +1087,27 @@ class CFMDDIMTests(unittest.TestCase):
 
         self.assertEqual(len(loop.diffusion.calls), 2)
         self.assertEqual(
-            loop.diffusion.calls,
+            [entry[:4] for entry in loop.diffusion.calls],
             [
-                (True, "eval", torch.device("cpu"), torch.Size([2, 3, 4, 4])),
-                (False, "eval", torch.device("cpu"), torch.Size([2, 3, 4, 4])),
+                (True, "eval", torch.device("cpu"), torch.Size([6, 3, 4, 4])),
+                (False, "eval", torch.device("cpu"), torch.Size([6, 3, 4, 4])),
             ],
         )
+        first_times = [entry[4:] for entry in loop.diffusion.calls]
+        with redirect_stdout(StringIO()):
+            repeated_metrics = loop.evaluate_validation(global_step=20)
+        repeated_times = [entry[4:] for entry in loop.diffusion.calls[2:]]
+        for first_regime, repeated_regime in zip(first_times, repeated_times):
+            self.assertTrue(torch.equal(first_regime[0], repeated_regime[0]))
+            self.assertTrue(torch.equal(first_regime[1], repeated_regime[1]))
+        self.assertEqual(metrics, repeated_metrics)
         self.assertEqual(metrics["Validation/cfm_instantaneous_loss"], 2.0)
         self.assertEqual(metrics["Validation/cfm_cumulative_loss"], 4.0)
         self.assertEqual(metrics["Validation/lpips_instantaneous_loss"], 3.0)
         self.assertEqual(metrics["Validation/lpips_terminal_loss"], 5.0)
-        self.assertEqual(metrics["Validation/loss"], 4.4)
+        self.assertEqual(metrics["Validation/loss"], 3.8)
         self.assertEqual(metrics["Validation/loss_balanced"], 3.8)
-        self.assertEqual(metrics["Validation/cfm_d_rms"], 0.0)
+        self.assertEqual(metrics["Validation/cfm_d_rms"], 15.0)
         self.assertNotIn("Validation/cfm_k_abs", metrics)
         self.assertNotIn("Validation/cfm_time_coefficient_abs", metrics)
         self.assertNotIn("Validation/num_examples", metrics)
@@ -1036,7 +1160,7 @@ class CFMDDIMTests(unittest.TestCase):
         loop.val_max_batches = 0
         loop.val_seed = 1234
         loop.cfm_val_time_samples_per_example = 4
-        loop.cfm_val_instantaneous_prob = 0.25
+        loop.cfm_val_instantaneous_fraction = 0.25
         loop.resume_step = 0
         loop.args = SimpleNamespace(use_wandb=0)
 
@@ -1073,7 +1197,12 @@ class CFMDDIMTests(unittest.TestCase):
                 inner_self.received_rendered_shape = tuple(
                     target_rendered_images.shape
                 )
-                return {"loss": torch.full((target_control_points.shape[0],), 5.0)}
+                batch_size = target_control_points.shape[0]
+                return {
+                    "LPIPS": torch.full((batch_size,), 2.0),
+                    "L1_points": torch.full((batch_size,), 3.0),
+                    "loss": torch.full((batch_size,), 5.0),
+                }
 
         loop = TrainLoop.__new__(TrainLoop)
         loop.model = CountingModel()
@@ -1097,6 +1226,8 @@ class CFMDDIMTests(unittest.TestCase):
             metrics = loop.evaluate_validation(global_step=10)
 
         self.assertEqual(loop.diffusion.received_rendered_shape, (2, 3, 4, 4))
+        self.assertEqual(metrics["Validation/LPIPS"], 2.0)
+        self.assertEqual(metrics["Validation/L1_points"], 3.0)
         self.assertEqual(metrics["Validation/loss"], 5.0)
         self.assertNotIn("Validation/loss_instantaneous", metrics)
         self.assertNotIn("Validation/loss_cumulative", metrics)
@@ -1105,7 +1236,7 @@ class CFMDDIMTests(unittest.TestCase):
 
     def test_multi_time_sampling_has_exact_ratio_for_every_example(self):
         batch_size = 3
-        samples_per_example = 4
+        samples_per_example = 6
         generator = torch.Generator(device="cpu")
         generator.manual_seed(17)
         time_t, time_r = sample_cfm_time_pairs(
@@ -1126,7 +1257,7 @@ class CFMDDIMTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 instantaneous.sum(dim=1),
-                torch.full((batch_size,), 2, dtype=torch.long),
+                torch.full((batch_size,), 3, dtype=torch.long),
             )
         )
 

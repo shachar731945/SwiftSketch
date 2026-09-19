@@ -396,7 +396,7 @@
 #   --diffusion_steps 10000 \
 #   --cfm_time_samples_per_example 256 \
 #   --cfm_val_time_samples_per_example 256 \
-#   --cfm_val_instantaneous_prob 0.5
+#   --cfm_val_instantaneous_fraction 0.5
 
 # Try number 2
 # source ../initialize.sh
@@ -420,7 +420,7 @@
 #   --diffusion_steps 10000 \
 #   --cfm_time_samples_per_example 256 \
 #   --cfm_val_time_samples_per_example 256 \
-#   --cfm_val_instantaneous_prob 0.5
+#   --cfm_val_instantaneous_fraction 0.5
 
 # for cfm_steps in 1 2 3 4 10 50 200 1000; do
 #     python -m generate \
@@ -448,78 +448,63 @@
 #########################################################################################################################
 # Training angel class with the cfm pipeline
 
-# source ../initialize.sh
-python -m train.train_SwiftSketch \
-  --save_dir "./train_results/cfm_angel" \
-  --title "cfm_angel_from_ddpm_1e6lr_lpips2_article_model_start" \
-  --init_checkpoint "../models/angel_with_val_trained_models/sketch-diffusion/model000073552.pt" \
-  --num_steps 500000 \
-  --data_name "cfm_angel_angel_data" --use_data_cache 1 \
-  --cat_data_size 1000 \
-  --batch_size 16 --cfm_time_samples_per_example 1 --cfm_instantaneous_prob 0.5 \
-  --val_batch_size 4 --cfm_val_time_samples_per_example 4 --cfm_val_instantaneous_prob 0.5 \
-  --lr 1e-06 \
-  --train_data_dir "../dataset_controlsketch/train/angel" \
-  --val_data_dir "../dataset_controlsketch/validation/angel" \
-  --save_interval 2000 \
-  --log_interval 500 \
-  --use_wandb 1 \
-  --wandb_user "shahar_avni-wis" \
-  --wandb_project_name "swiftsketch_train" \
-  --device 0 \
-  --diffusion_mode cfm_ddim \
-  --diffusion_steps 50 \
-  --normalize_model_output 1 \
-  --lpips_weight 1 --l1_points_weight 0 \
-  --media_interval 5000 \
-  --media_output_mode both \
-  --media_cfm_sampling_steps 1 4 \
-  --media_instantaneous_times 0.25 0.5 0.75 1.0 \
-  --media_guidance_param 1 \
-  --media_log_at_start 1
-
-# source ../initialize.sh
 # python -m train.train_SwiftSketch \
 #   --save_dir "./train_results/cfm_angel" \
-#   --resume_checkpoint "./train_results/cfm_angel/cfm_angel_class_1e5_lrCLIPMiddle_layer4_seed20_/model000025000.pt" \
-#   --title "cfm_angel_class_1e5_lr" \
-#   --num_steps 500000 \
-#   --data_name "cfm_angel_angel_data" --use_data_cache 1 \
+#   --title "cfm_angel_from_ddpm_2e6lr_lpips1.8_article_model_start" \
+#   --resume_checkpoint "./train_results/cfm_angel/cfm_angel_from_ddpm_2e6lr_lpips1.8_article_model_startCLIPMiddle_layer4_seed20_1.8lpips/model000012000.pt" \
+#   --num_steps 100000 \
+#   --data_name "cfm_angel_data" --use_data_cache 1 \
 #   --cat_data_size 1000 \
-#   --batch_size 10 \
-#   --lr 1e-05 \
+#   --batch_size 32 --cfm_time_samples_per_example 1 --cfm_instantaneous_prob 0.5 \
+#   --val_batch_size 20 --cfm_val_time_samples_per_example 6 --cfm_val_instantaneous_fraction 0.5 \
+#   --lr 2e-06 \
 #   --train_data_dir "../dataset_controlsketch/train/angel" \
 #   --val_data_dir "../dataset_controlsketch/validation/angel" \
 #   --save_interval 2000 \
-#   --log_interval 1000 \
+#   --log_interval 500 \
 #   --use_wandb 1 \
 #   --wandb_user "shahar_avni-wis" \
 #   --wandb_project_name "swiftsketch_train" \
 #   --device 1 \
 #   --diffusion_mode cfm_ddim \
-#   --diffusion_steps 10000 \
-#   --cfm_time_samples_per_example 80 \
-#   --cfm_val_time_samples_per_example 80 \
-#   --cfm_val_instantaneous_prob 0.5
+#   --diffusion_steps 50 \
+#   --normalize_model_output 1 \
+#   --lpips_weight 1.8 --l1_points_weight 0 \
+#   --media_interval 5000 \
+#   --media_output_mode both \
+#   --media_cfm_sampling_steps 1 4 \
+#   --media_instantaneous_times 0.25 0.5 0.75 1.0 \
+#   --media_guidance_param 1 \
+#   --media_log_at_start 1
+  # --init_checkpoint "../models/all_classes_trained_models_fron_article/sketch-diffusion/model000450000.pt" \
 
-# for cfm_steps in 1 4 20; do
-#   for guidance_param in 2.5; do
-#     python -m generate \
-#         --model_path "./train_results/cfm_angel/cfm_angel_class_5e6_lrCLIPMiddle_layer4_seed20_/model000035000.pt" \
-#         --use_refine 0 \
-#         --input_data "../dataset_controlsketch/train/angel" \
-#         --output_dir "../output_sketches/cfm_angel/train_5e6_lr/cfm_angel_${cfm_steps}_steps_${guidance_param}_gp" \
-#         --guidance_param "${guidance_param}" \
-#         --save_final_sketch_in_dict 0 \
-#         --cfm_sampling_steps "${cfm_steps}"
+for cfm_steps in 1 4 10 50 ; do
+  for guidance_param in 2.5; do
+#     # python -m generate \
+#     #     --model_path "SwiftSketch/train_results/cfm_angel/cfm_angel_from_ddpm_2e6lr_lpips1.8_angel_model_startCLIPMiddle_layer4_seed20_1.8lpips/model000034000.pt" \
+#     #     --use_refine 0 \
+#     #     --input_data "../dataset_controlsketch/train/angel" \
+#     #     --output_dir "../output_sketches/cfm_angel/train_5e6_lr/cfm_angel_${cfm_steps}_steps_${guidance_param}_gp" \
+#     #     --guidance_param "${guidance_param}" \
+#     #     --save_final_sketch_in_dict 0 \
+#     #     --cfm_sampling_steps "${cfm_steps}"
 
-#     python -m generate \
-#         --model_path "./train_results/cfm_angel/cfm_angel_class_5e6_lrCLIPMiddle_layer4_seed20_/model000035000.pt" \
-#         --use_refine 0 \
-#         --input_data "../dataset_controlsketch/validation/angel" \
-#         --output_dir "../output_sketches/cfm_angel/val_5e6_lr/cfm_angel_${cfm_steps}_steps_${guidance_param}_gp" \
-#         --guidance_param "${guidance_param}" \
-#         --save_final_sketch_in_dict 0 \
-#         --cfm_sampling_steps "${cfm_steps}"
-#   done
-# done
+    # python -m generate \
+    #     --model_path "./train_results/cfm_angel/cfm_angel_from_ddpm_2e6lr_lpips1.8_article_model_startCLIPMiddle_layer4_seed20_1.8lpips/model000028000.pt" \
+    #     --use_refine 0 \
+    #     --input_data "../dataset_controlsketch/validation/angel" \
+    #     --output_dir "../output_sketches/cfm_angel/article_model_start_val_2e6lr_lpips1.8/cfm_angel_${cfm_steps}_steps_${guidance_param}_gp" \
+    #     --guidance_param "${guidance_param}" \
+    #     --save_final_sketch_in_dict 0 \
+    #     --cfm_sampling_steps "${cfm_steps}"
+
+    python -m generate \
+        --model_path "./train_results/cfm_angel/cfm_angel_from_ddpm_2e6lr_lpips1.8_angel_model_startCLIPMiddle_layer4_seed20_1.8lpips/model000060000.pt" \
+        --use_refine 0 \
+        --input_data "../dataset_controlsketch/validation/angel" \
+        --output_dir "../output_sketches/cfm_angel/angel_model_start_val_2e6lr_lpips1.8_60k_checkpoint/cfm_angel_${cfm_steps}_steps_${guidance_param}_gp" \
+        --guidance_param "${guidance_param}" \
+        --save_final_sketch_in_dict 0 \
+        --cfm_sampling_steps "${cfm_steps}"
+  done
+done

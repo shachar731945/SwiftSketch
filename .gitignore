@@ -30,8 +30,13 @@ control_script.sh
 *.pt
 **/args.json
 
+*.pptx
+*.ppt
+
 *.pdf
 *.svg
 
 *_PLAN.md
+
+node_modules/
 

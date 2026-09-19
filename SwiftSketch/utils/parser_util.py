@@ -41,31 +41,31 @@ def resolve_cfm_validation_sampling(
     training_samples_per_example,
     training_instantaneous_probability,
     validation_samples_per_example,
-    validation_instantaneous_probability,
+    validation_instantaneous_fraction,
 ):
-    """Resolve inherited CFM validation settings and enforce split availability."""
+    """Resolve validation settings and enforce an exact per-example split."""
     samples_per_example = (
         training_samples_per_example
         if validation_samples_per_example == 0
         else validation_samples_per_example
     )
-    instantaneous_probability = (
+    instantaneous_fraction = (
         training_instantaneous_probability
-        if validation_instantaneous_probability is None
-        else validation_instantaneous_probability
+        if validation_instantaneous_fraction is None
+        else validation_instantaneous_fraction
     )
     get_cfm_instantaneous_samples_per_example(
         samples_per_example,
-        instantaneous_probability,
+        instantaneous_fraction,
         sample_count_argument="--cfm_val_time_samples_per_example",
-        probability_argument="--cfm_val_instantaneous_prob",
+        probability_argument="--cfm_val_instantaneous_fraction",
     )
-    if samples_per_example == 1 and 0.0 < instantaneous_probability < 1.0:
+    if samples_per_example == 1 and 0.0 < instantaneous_fraction < 1.0:
         raise ValueError(
             "The effective --cfm_val_time_samples_per_example must be at least "
-            "2 when --cfm_val_instantaneous_prob is strictly between 0 and 1."
+            "2 when --cfm_val_instantaneous_fraction is strictly between 0 and 1."
         )
-    return samples_per_example, instantaneous_probability
+    return samples_per_example, instantaneous_fraction
 
 
 
@@ -276,8 +276,16 @@ def add_training_options(parser):
     group.add_argument("--cfm_val_time_samples_per_example", default=0, type=int,
                        help="Independent CFM time/noise samples per validation example. "
                             "Set to 0 to inherit --cfm_time_samples_per_example.")
-    group.add_argument("--cfm_val_instantaneous_prob", default=None, type=float,
-                       help="Validation probability for t=r. Omit to inherit --cfm_instantaneous_prob.")
+    group.add_argument(
+        "--cfm_val_instantaneous_fraction",
+        "--cfm_val_instantaneous_prob",
+        dest="cfm_val_instantaneous_fraction",
+        default=None,
+        type=float,
+        help="Exact validation fraction of t=r pairs per example. Omit to inherit "
+             "--cfm_instantaneous_prob. The old --cfm_val_instantaneous_prob name "
+             "is retained as an alias.",
+    )
     group.add_argument("--save_interval", default=10_000, type=int,
                        help="Save checkpoints each N steps")
     group.add_argument("--num_steps", default=60_000, type=int,
@@ -414,47 +422,30 @@ def train_args():
             parser.error(
                 "CFM-DDIM does not use the L1 point loss; set --l1_points_weight 0."
             )
+        try:
+            get_cfm_instantaneous_samples_per_example(
+                args.cfm_time_samples_per_example,
+                args.cfm_instantaneous_prob,
+            )
+            if args.val_data_dir:
+                resolve_cfm_validation_sampling(
+                    args.cfm_time_samples_per_example,
+                    args.cfm_instantaneous_prob,
+                    args.cfm_val_time_samples_per_example,
+                    args.cfm_val_instantaneous_fraction,
+                )
+        except ValueError as error:
+            parser.error(str(error))
         if cfm_lpips_enabled:
             if args.cfm_time_samples_per_example != 1:
                 parser.error(
                     "CFM-DDIM with LPIPS requires --cfm_time_samples_per_example 1."
-                )
-            effective_val_samples = (
-                args.cfm_val_time_samples_per_example
-                or args.cfm_time_samples_per_example
-            )
-            if effective_val_samples != 1:
-                parser.error(
-                    "CFM-DDIM with LPIPS requires --cfm_val_time_samples_per_example "
-                    "0 or 1; validation evaluates every endpoint regime explicitly."
                 )
             if args.normalize_model_output != 1:
                 parser.error(
                     "CFM-DDIM with LPIPS requires --normalize_model_output 1 so the "
                     "existing tanh output normalization bounds rendered points."
                 )
-            validation_probability = (
-                args.cfm_instantaneous_prob
-                if args.cfm_val_instantaneous_prob is None
-                else args.cfm_val_instantaneous_prob
-            )
-            if not 0.0 <= validation_probability <= 1.0:
-                parser.error("--cfm_val_instantaneous_prob must be between 0 and 1.")
-        else:
-            try:
-                get_cfm_instantaneous_samples_per_example(
-                    args.cfm_time_samples_per_example,
-                    args.cfm_instantaneous_prob,
-                )
-                if args.val_data_dir:
-                    resolve_cfm_validation_sampling(
-                        args.cfm_time_samples_per_example,
-                        args.cfm_instantaneous_prob,
-                        args.cfm_val_time_samples_per_example,
-                        args.cfm_val_instantaneous_prob,
-                    )
-            except ValueError as error:
-                parser.error(str(error))
         if args.cfm_loss_weight <= 0:
             parser.error("--cfm_loss_weight must be positive.")
     if args.init_checkpoint and args.resume_checkpoint:

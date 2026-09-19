@@ -48,33 +48,27 @@ class TrainLoop:
             args, "cfm_time_samples_per_example", 1
         )
         self.cfm_val_time_samples_per_example = self.cfm_time_samples_per_example
-        self.cfm_val_instantaneous_prob = self.cfm_instantaneous_prob
+        self.cfm_val_instantaneous_fraction = self.cfm_instantaneous_prob
         if self.diffusion_mode == "cfm_ddim":
             get_cfm_instantaneous_samples_per_example(
                 self.cfm_time_samples_per_example,
                 self.cfm_instantaneous_prob,
             )
             if self.validation_data is not None:
-                if self.cfm_lpips_enabled:
-                    self.cfm_val_time_samples_per_example = (
-                        getattr(args, "cfm_val_time_samples_per_example", 0)
-                        or self.cfm_time_samples_per_example
-                    )
-                    self.cfm_val_instantaneous_prob = (
-                        self.cfm_instantaneous_prob
-                        if getattr(args, "cfm_val_instantaneous_prob", None) is None
-                        else args.cfm_val_instantaneous_prob
-                    )
-                else:
-                    (
-                        self.cfm_val_time_samples_per_example,
-                        self.cfm_val_instantaneous_prob,
-                    ) = resolve_cfm_validation_sampling(
-                        self.cfm_time_samples_per_example,
-                        self.cfm_instantaneous_prob,
-                        getattr(args, "cfm_val_time_samples_per_example", 0),
-                        getattr(args, "cfm_val_instantaneous_prob", None),
-                    )
+                validation_fraction = getattr(
+                    args,
+                    "cfm_val_instantaneous_fraction",
+                    getattr(args, "cfm_val_instantaneous_prob", None),
+                )
+                (
+                    self.cfm_val_time_samples_per_example,
+                    self.cfm_val_instantaneous_fraction,
+                ) = resolve_cfm_validation_sampling(
+                    self.cfm_time_samples_per_example,
+                    self.cfm_instantaneous_prob,
+                    getattr(args, "cfm_val_time_samples_per_example", 0),
+                    validation_fraction,
+                )
         self.use_fp16 = False  
         self.fp16_scale_growth = 1e-3  
         self.weight_decay = args.weight_decay
@@ -316,69 +310,86 @@ class TrainLoop:
                     batch_size = target_control_points.shape[0]
                     if self.diffusion_mode == "cfm_ddim":
                         if cfm_lpips_enabled:
+                            samples_per_example = self.cfm_val_time_samples_per_example
+                            (
+                                cfm_target_control_points,
+                                cfm_image_features,
+                            ) = expand_cfm_training_batch(
+                                target_control_points,
+                                image_features,
+                                samples_per_example,
+                            )
+                            cfm_target_rendered_images = (
+                                target_rendered_images.repeat_interleave(
+                                    samples_per_example, dim=0
+                                )
+                            )
                             noise = torch.randn(
-                                target_control_points.shape,
-                                dtype=target_control_points.dtype,
+                                cfm_target_control_points.shape,
+                                dtype=cfm_target_control_points.dtype,
                                 device=self.device,
                                 generator=generator,
                             )
                             time_t, time_r = sample_cfm_time_pairs(
                                 batch_size,
                                 1.0,
-                                0.0,
+                                self.cfm_val_instantaneous_fraction,
                                 self.device,
                                 generator=generator,
-                                samples_per_example=1,
+                                samples_per_example=samples_per_example,
                             )
-                            instantaneous_losses = self.diffusion.training_cfm_ddim_losses(
-                                self.model,
-                                target_control_points,
-                                image_features,
-                                time_t,
-                                time_t,
-                                noise=noise,
-                                target_rendered_images=target_rendered_images,
-                                mode="eval",
-                                render_device=torch.device("cpu"),
-                            )
-                            cumulative_losses = self.diffusion.training_cfm_ddim_losses(
-                                self.model,
-                                target_control_points,
-                                image_features,
-                                time_t,
-                                time_r,
-                                noise=noise,
-                                target_rendered_images=target_rendered_images,
-                                mode="eval",
-                                render_device=torch.device("cpu"),
-                            )
-                            cfm_instantaneous_loss_total += instantaneous_losses[
-                                "cfm_ddim_loss"
-                            ].detach().float().sum().item()
-                            cfm_cumulative_loss_total += cumulative_losses[
-                                "cfm_ddim_loss"
-                            ].detach().float().sum().item()
-                            cfm_lpips_instantaneous_total += (
-                                instantaneous_losses["lpips_loss"].detach().float().item()
-                                * batch_size
-                            )
-                            cfm_lpips_terminal_total += (
-                                cumulative_losses["lpips_loss"].detach().float().item()
-                                * batch_size
-                            )
-                            cfm_instantaneous_count += batch_size
-                            cfm_cumulative_count += batch_size
-
-                            for key in ("cfm_d_rms",):
-                                weighted_value = (
-                                    self.cfm_val_instantaneous_prob
-                                    * instantaneous_losses[key].detach().float().mean()
-                                    + (1.0 - self.cfm_val_instantaneous_prob)
-                                    * cumulative_losses[key].detach().float().mean()
+                            instantaneous = torch.isclose(time_t, time_r)
+                            cumulative = ~instantaneous
+                            for regime, mask in (
+                                ("instantaneous", instantaneous),
+                                ("cumulative", cumulative),
+                            ):
+                                regime_count = int(mask.sum().item())
+                                if regime_count == 0:
+                                    continue
+                                regime_losses = self.diffusion.training_cfm_ddim_losses(
+                                    self.model,
+                                    cfm_target_control_points[mask],
+                                    (
+                                        None
+                                        if cfm_image_features is None
+                                        else cfm_image_features[mask]
+                                    ),
+                                    time_t[mask],
+                                    time_r[mask],
+                                    noise=noise[mask],
+                                    target_rendered_images=(
+                                        cfm_target_rendered_images[mask]
+                                    ),
+                                    mode="eval",
+                                    render_device=torch.device("cpu"),
                                 )
-                                totals[key] = (
-                                    totals.get(key, 0.0)
-                                    + weighted_value.item() * batch_size
+                                cfm_loss_sum = regime_losses[
+                                    "cfm_ddim_loss"
+                                ].detach().float().sum().item()
+                                lpips_loss_sum = (
+                                    regime_losses["lpips_loss"]
+                                    .detach()
+                                    .float()
+                                    .item()
+                                    * regime_count
+                                )
+                                if regime == "instantaneous":
+                                    cfm_instantaneous_loss_total += cfm_loss_sum
+                                    cfm_lpips_instantaneous_total += lpips_loss_sum
+                                    cfm_instantaneous_count += regime_count
+                                else:
+                                    cfm_cumulative_loss_total += cfm_loss_sum
+                                    cfm_lpips_terminal_total += lpips_loss_sum
+                                    cfm_cumulative_count += regime_count
+                                totals["cfm_d_rms"] = (
+                                    totals.get("cfm_d_rms", 0.0)
+                                    + regime_losses["cfm_d_rms"]
+                                    .detach()
+                                    .float()
+                                    .sum()
+                                    .item()
+                                    / samples_per_example
                                 )
                             losses = None
                         else:
@@ -400,7 +411,7 @@ class TrainLoop:
                             time_t, time_r = sample_cfm_time_pairs(
                                 batch_size,
                                 1.0,
-                                self.cfm_val_instantaneous_prob,
+                                self.cfm_val_instantaneous_fraction,
                                 self.device,
                                 generator=generator,
                                 samples_per_example=self.cfm_val_time_samples_per_example,
@@ -476,8 +487,9 @@ class TrainLoop:
                     cfm_cumulative_loss_total,
                     cfm_lpips_instantaneous_total,
                     cfm_lpips_terminal_total,
-                    num_examples,
-                    self.cfm_val_instantaneous_prob,
+                    cfm_instantaneous_count,
+                    cfm_cumulative_count,
+                    self.cfm_val_instantaneous_fraction,
                     self.args.cfm_loss_weight,
                     self.args.lpips_weight,
                 )
@@ -489,7 +501,7 @@ class TrainLoop:
                     cfm_instantaneous_count,
                     cfm_cumulative_loss_total,
                     cfm_cumulative_count,
-                    self.cfm_val_instantaneous_prob,
+                    self.cfm_val_instantaneous_fraction,
                 )
             )
         print(
@@ -666,7 +678,7 @@ def calculate_cfm_validation_loss_metrics(
     instantaneous_count,
     cumulative_loss_total,
     cumulative_count,
-    instantaneous_probability,
+    instantaneous_fraction,
 ):
     """Build CFM validation metrics, omitting unavailable split statistics."""
     metrics = {}
@@ -682,8 +694,8 @@ def calculate_cfm_validation_loss_metrics(
 
     if instantaneous_loss is not None and cumulative_loss is not None:
         metrics["Validation/loss"] = (
-            instantaneous_probability * instantaneous_loss
-            + (1.0 - instantaneous_probability) * cumulative_loss
+            instantaneous_fraction * instantaneous_loss
+            + (1.0 - instantaneous_fraction) * cumulative_loss
         )
         metrics["Validation/loss_balanced"] = 0.5 * (
             instantaneous_loss + cumulative_loss
@@ -701,39 +713,52 @@ def calculate_cfm_lpips_validation_metrics(
     cfm_cumulative_total,
     lpips_instantaneous_total,
     lpips_terminal_total,
-    num_examples,
-    instantaneous_probability,
+    instantaneous_count,
+    cumulative_count,
+    instantaneous_fraction,
     cfm_weight,
     lpips_weight,
 ):
-    """Combine explicit CFM/LPIPS validation regimes without batch bias."""
-    if num_examples <= 0:
-        raise ValueError("CFM LPIPS validation requires at least one example.")
+    """Combine exact validation regimes and omit unavailable components."""
+    metrics = {}
+    instantaneous_total_loss = None
+    cumulative_total_loss = None
 
-    cfm_instantaneous = cfm_instantaneous_total / num_examples
-    cfm_cumulative = cfm_cumulative_total / num_examples
-    lpips_instantaneous = lpips_instantaneous_total / num_examples
-    lpips_terminal = lpips_terminal_total / num_examples
-    weighted_cfm = (
-        instantaneous_probability * cfm_instantaneous
-        + (1.0 - instantaneous_probability) * cfm_cumulative
-    )
-    weighted_lpips = (
-        instantaneous_probability * lpips_instantaneous
-        + (1.0 - instantaneous_probability) * lpips_terminal
-    )
+    if instantaneous_count:
+        cfm_instantaneous = cfm_instantaneous_total / instantaneous_count
+        lpips_instantaneous = lpips_instantaneous_total / instantaneous_count
+        metrics["Validation/cfm_instantaneous_loss"] = cfm_instantaneous
+        metrics["Validation/lpips_instantaneous_loss"] = lpips_instantaneous
+        instantaneous_total_loss = (
+            cfm_weight * cfm_instantaneous
+            + lpips_weight * lpips_instantaneous
+        )
 
-    return {
-        "Validation/cfm_instantaneous_loss": cfm_instantaneous,
-        "Validation/cfm_cumulative_loss": cfm_cumulative,
-        "Validation/lpips_instantaneous_loss": lpips_instantaneous,
-        "Validation/lpips_terminal_loss": lpips_terminal,
-        "Validation/loss": cfm_weight * weighted_cfm + lpips_weight * weighted_lpips,
-        "Validation/loss_balanced": (
-            cfm_weight * 0.5 * (cfm_instantaneous + cfm_cumulative)
-            + lpips_weight * 0.5 * (lpips_instantaneous + lpips_terminal)
-        ),
-    }
+    if cumulative_count:
+        cfm_cumulative = cfm_cumulative_total / cumulative_count
+        lpips_terminal = lpips_terminal_total / cumulative_count
+        metrics["Validation/cfm_cumulative_loss"] = cfm_cumulative
+        metrics["Validation/lpips_terminal_loss"] = lpips_terminal
+        cumulative_total_loss = (
+            cfm_weight * cfm_cumulative + lpips_weight * lpips_terminal
+        )
+
+    if instantaneous_total_loss is not None and cumulative_total_loss is not None:
+        metrics["Validation/loss"] = (
+            instantaneous_fraction * instantaneous_total_loss
+            + (1.0 - instantaneous_fraction) * cumulative_total_loss
+        )
+        metrics["Validation/loss_balanced"] = 0.5 * (
+            instantaneous_total_loss + cumulative_total_loss
+        )
+    elif instantaneous_total_loss is not None:
+        metrics["Validation/loss"] = instantaneous_total_loss
+    elif cumulative_total_loss is not None:
+        metrics["Validation/loss"] = cumulative_total_loss
+    else:
+        raise ValueError("CFM LPIPS validation requires at least one time pair.")
+
+    return metrics
 
 
 def format_validation_console_message(global_step, validation_metrics, diffusion_mode):
@@ -744,7 +769,13 @@ def format_validation_console_message(global_step, validation_metrics, diffusion
             validation_metrics["Validation/loss"],
         )
 
-    if "Validation/lpips_instantaneous_loss" in validation_metrics:
+    if any(
+        key in validation_metrics
+        for key in (
+            "Validation/lpips_instantaneous_loss",
+            "Validation/lpips_terminal_loss",
+        )
+    ):
         metric_labels = (
             ("Validation/cfm_instantaneous_loss", "val_cfm_instantaneous_loss"),
             ("Validation/cfm_cumulative_loss", "val_cfm_cumulative_loss"),
